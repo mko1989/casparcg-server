@@ -18,7 +18,7 @@ uniform bool key_only;
 uniform int colour_space;
 uniform int window_width;
 
-// Enhanced color controls
+// MERGED: Our enhancement uniforms for LED wall calibration
 uniform float brightness_boost;
 uniform float saturation_boost;
 
@@ -56,18 +56,24 @@ void main()
         color.p = clamp(color.w + RANGE_HALF, 0.0f, 1.0f);
     }
     
-    // Apply color enhancements (after color space conversion)
-    // Only apply to RGB channels, not key-only mode
-    if (!key_only && colour_space == COLOUR_SPACE_RGB) {
-        // Brightness boost
+    // MERGED: Apply brightness and saturation boosts
+    // Only apply to RGB color space (not DataVideo modes which are already in YUV)
+    if (colour_space == COLOUR_SPACE_RGB && !key_only) {
+        // Apply brightness boost
         color.rgb *= brightness_boost;
         
-        // Saturation boost (preserves luminance)
-        float luma = dot(color.rgb, vec3(0.299f, 0.587f, 0.114f));
-        color.rgb = mix(vec3(luma), color.rgb, saturation_boost);
+        // Apply saturation boost
+        // Calculate luminance (grayscale value)
+        float luminance = dot(color.rgb, vec3(0.299, 0.587, 0.114));
+        vec3 gray = vec3(luminance);
+        // Interpolate between grayscale and full color based on saturation_boost
+        // saturation_boost = 1.0 → normal color
+        // saturation_boost > 1.0 → more saturated
+        // saturation_boost < 1.0 → less saturated (closer to grayscale)
+        color.rgb = mix(gray, color.rgb, saturation_boost);
         
         // Clamp to valid range
-        color.rgb = clamp(color.rgb, 0.0f, 1.0f);
+        color.rgb = clamp(color.rgb, 0.0, 1.0);
     }
     
     fragColor = color;
