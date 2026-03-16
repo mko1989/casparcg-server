@@ -1,5 +1,5 @@
 /*
- * portaudio_consumer.cpp - Multi-Channel ASIO Audio Output with Video-Scheduled Sync
+ * portaudio_consumer.cpp - Multi-Channel Audio Output with Video-Scheduled Sync
  * Based on OAL consumer video-scheduled architecture, adapted for PortAudio callback model
  */
 
@@ -139,101 +139,163 @@ class float_fifo
     std::atomic<size_t> read_idx_{0};
 };
 
-// Find the ASIO host API
-int find_asio_host_api()
+// Resolve a host API type string to a PaHostApiTypeId.
+// Supported values: "ASIO", "ALSA", "JACK", "WASAPI", "auto"
+// "auto" selects ASIO on Windows (falling back to WASAPI), ALSA on Linux (falling back to default).
+PaHostApiTypeId resolve_host_api_type(const std::wstring& host_api_str)
+{
+#if defined(_WIN32)
+    if (host_api_str.empty() || boost::iequals(host_api_str, L"auto") || boost::iequals(host_api_str, L"ASIO"))
+        return paASIO;
+    if (boost::iequals(host_api_str, L"WASAPI"))
+        return paWASAPI;
+#else
+    if (host_api_str.empty() || boost::iequals(host_api_str, L"auto") || boost::iequals(host_api_str, L"ALSA"))
+        return paALSA;
+    if (boost::iequals(host_api_str, L"JACK"))
+        return paJACK;
+#endif
+    if (boost::iequals(host_api_str, L"ASIO"))
+        return paASIO;
+    if (boost::iequals(host_api_str, L"ALSA"))
+        return paALSA;
+    if (boost::iequals(host_api_str, L"JACK"))
+        return paJACK;
+    if (boost::iequals(host_api_str, L"WASAPI"))
+        return paWASAPI;
+
+    CASPAR_LOG(warning) << L"Unknown host-api '" << host_api_str << L"', using platform default";
+#if defined(_WIN32)
+    return paASIO;
+#else
+    return paALSA;
+#endif
+}
+
+// Find a host API index by type. Returns -1 if not available.
+int find_host_api(PaHostApiTypeId type)
 {
     int numApis = Pa_GetHostApiCount();
     for (int i = 0; i < numApis; i++) {
         const PaHostApiInfo* apiInfo = Pa_GetHostApiInfo(i);
-        if (apiInfo && apiInfo->type == paASIO) {
+        if (apiInfo && apiInfo->type == type) {
             return i;
         }
     }
     return -1;
 }
 
-// Device name matching helper - ASIO-specific
-int find_device_by_name(const std::wstring& device_name)
+// Find the best available host API index for the configured type.
+// On Windows: ASIO -> WASAPI -> default
+// On Linux:   ALSA -> JACK -> default
+int find_best_host_api(PaHostApiTypeId preferred_type, std::wstring& out_api_name)
 {
-    // First, find the ASIO host API
-    int asio_api_index = find_asio_host_api();
+    int api_index = find_host_api(preferred_type);
+    if (api_index >= 0) {
+        out_api_name = std::wstring(Pa_GetHostApiInfo(api_index)->name,
+                                   Pa_GetHostApiInfo(api_index)->name +
+                                   strlen(Pa_GetHostApiInfo(api_index)->name));
+        return api_index;
+    }
 
-    if (asio_api_index < 0) {
-        CASPAR_LOG(error) << L"ASIO host API not found!";
-        CASPAR_LOG(error) << L"Make sure you have ASIO drivers installed.";
+#if defined(_WIN32)
+    CASPAR_LOG(warning) << L"Preferred host API not available, trying WASAPI";
+    api_index = find_host_api(paWASAPI);
+    if (api_index >= 0) {
+        out_api_name = L"WASAPI";
+        return api_index;
+    }
+#else
+    CASPAR_LOG(warning) << L"Preferred host API not available, trying ALSA";
+    api_index = find_host_api(paALSA);
+    if (api_index >= 0) {
+        out_api_name = L"ALSA";
+        return api_index;
+    }
+#endif
+
+    // Last resort: PortAudio default
+    api_index = Pa_GetDefaultHostApi();
+    if (api_index >= 0) {
+        const PaHostApiInfo* info = Pa_GetHostApiInfo(api_index);
+        out_api_name = std::wstring(info->name, info->name + strlen(info->name));
+        CASPAR_LOG(warning) << L"Falling back to PortAudio default host API: " << out_api_name;
+        return api_index;
+    }
+
+    return -1;
+}
+
+// Find a device by name within the specified host API index.
+// Falls back to the API's default output device if name not found.
+int find_device_by_name(const std::wstring& device_name, int api_index)
+{
+    const PaHostApiInfo* apiInfo = Pa_GetHostApiInfo(api_index);
+    if (!apiInfo) {
         return -1;
     }
 
-    const PaHostApiInfo* asioApi = Pa_GetHostApiInfo(asio_api_index);
-    CASPAR_LOG(info) << L"Found ASIO host API with " << asioApi->deviceCount << L" devices";
+    std::wstring api_name(apiInfo->name, apiInfo->name + strlen(apiInfo->name));
+    CASPAR_LOG(info) << L"Host API: " << api_name << L" (" << apiInfo->deviceCount << L" devices)";
 
-    // If no device name specified, use ASIO default
+    // If no device name specified, use API default
     if (device_name.empty()) {
-        int default_device = asioApi->defaultOutputDevice;
+        int default_device = apiInfo->defaultOutputDevice;
         if (default_device != paNoDevice) {
             const PaDeviceInfo* deviceInfo = Pa_GetDeviceInfo(default_device);
-            CASPAR_LOG(info) << L"Using default ASIO device: \"" << deviceInfo->name << L"\"";
+            CASPAR_LOG(info) << L"Using default device: \"" << deviceInfo->name << L"\"";
             return default_device;
         }
         return -1;
     }
 
-    // Prepare search string
     std::string search_name           = u8(device_name);
     std::string search_name_no_spaces = search_name;
     boost::algorithm::erase_all(search_name_no_spaces, " ");
     boost::algorithm::to_lower(search_name_no_spaces);
 
-    CASPAR_LOG(info) << L"------- ASIO Device List -----";
+    CASPAR_LOG(info) << L"------- Device List -----";
     CASPAR_LOG(info) << L"Searching for: \"" << device_name << L"\"";
 
     int found_device = -1;
 
-    // Only enumerate ASIO devices
-    for (int i = 0; i < asioApi->deviceCount; i++) {
-        int device_index = Pa_HostApiDeviceIndexToDeviceIndex(asio_api_index, i);
-        if (device_index < 0) {
+    for (int i = 0; i < apiInfo->deviceCount; i++) {
+        int device_index = Pa_HostApiDeviceIndexToDeviceIndex(api_index, i);
+        if (device_index < 0)
             continue;
-        }
 
         const PaDeviceInfo* deviceInfo = Pa_GetDeviceInfo(device_index);
-        if (!deviceInfo || deviceInfo->maxOutputChannels <= 0) {
+        if (!deviceInfo || deviceInfo->maxOutputChannels <= 0)
             continue;
-        }
 
-        CASPAR_LOG(info) << L"ASIO Device " << i << L": \"" << deviceInfo->name << L"\" - "
+        CASPAR_LOG(info) << L"Device " << i << L": \"" << deviceInfo->name << L"\" - "
                          << deviceInfo->maxOutputChannels << L" output channels";
 
-        // Fuzzy match
         std::string dev_name           = deviceInfo->name;
         std::string dev_name_no_spaces = dev_name;
         boost::algorithm::erase_all(dev_name_no_spaces, " ");
         boost::algorithm::to_lower(dev_name_no_spaces);
 
-        // First try exact match (with spaces)
         if (boost::iequals(search_name, dev_name)) {
             found_device = device_index;
             CASPAR_LOG(info) << L"  ** EXACT MATCH **";
-        }
-        // Then try fuzzy match (without spaces)
-        else if (boost::iequals(search_name_no_spaces, dev_name_no_spaces)) {
+        } else if (boost::iequals(search_name_no_spaces, dev_name_no_spaces)) {
             found_device = device_index;
             CASPAR_LOG(info) << L"  ** FUZZY MATCH **";
         }
     }
 
-    CASPAR_LOG(info) << L"------ ASIO Device List Done -----";
+    CASPAR_LOG(info) << L"------ Device List Done -----";
 
     if (found_device >= 0) {
         const PaDeviceInfo* deviceInfo = Pa_GetDeviceInfo(found_device);
-        CASPAR_LOG(info) << L"Selected ASIO device: \"" << deviceInfo->name << L"\"";
+        CASPAR_LOG(info) << L"Selected device: \"" << deviceInfo->name << L"\"";
     } else {
-        CASPAR_LOG(warning) << L"ASIO device \"" << device_name << L"\" not found";
-        // Try to use default ASIO device as fallback
-        int default_device = asioApi->defaultOutputDevice;
+        CASPAR_LOG(warning) << L"Device \"" << device_name << L"\" not found, using API default";
+        int default_device = apiInfo->defaultOutputDevice;
         if (default_device != paNoDevice) {
             const PaDeviceInfo* deviceInfo = Pa_GetDeviceInfo(default_device);
-            CASPAR_LOG(warning) << L"Using default ASIO device instead: \"" << deviceInfo->name << L"\"";
+            CASPAR_LOG(warning) << L"Using default device: \"" << deviceInfo->name << L"\"";
             found_device = default_device;
         }
     }
@@ -292,12 +354,13 @@ class portaudio_consumer : public core::frame_consumer
     std::chrono::high_resolution_clock::time_point channel_start_time_;
     std::atomic<int64_t>                           frame_counter_{0};
     double                                         frame_duration_seconds_ = 0.0;
-    std::atomic<int>                               audio_latency_compensation_ms_{40};
+    std::atomic<int>                               audio_latency_compensation_ms_{0};
 
     // PortAudio resources
     PaStream*     stream_          = nullptr;
     int           output_channels_ = 2;
     std::wstring  device_name_;
+    std::wstring  host_api_str_;     // "auto" | "ASIO" | "ALSA" | "JACK" | "WASAPI"
     int           device_index_       = -1;
     unsigned long buffer_size_frames_ = 128;
 
@@ -351,12 +414,12 @@ class portaudio_consumer : public core::frame_consumer
 
             audio_latency_compensation_ms_.store(new_compensation);
 
-            CASPAR_LOG(info) << L"Auto-tuned latency: " << old_compensation << L"ms â†’ " << new_compensation
+            CASPAR_LOG(info) << L"Auto-tuned latency: " << old_compensation << L"ms -> " << new_compensation
                              << L"ms (adjusted by " << adjustment << L"ms)";
         } else if (stddev_ms >= 30) {
             CASPAR_LOG(warning) << L"Auto-tune skipped: timing inconsistent (StdDev=" << stddev_ms << L"ms)";
         } else {
-            CASPAR_LOG(info) << L"Auto-tune: timing good (Â±" << avg_error_ms << L"ms)";
+            CASPAR_LOG(info) << L"Auto-tune: timing good (+/-" << avg_error_ms << L"ms)";
         }
 
         timing_samples_.clear();
@@ -562,13 +625,15 @@ class portaudio_consumer : public core::frame_consumer
 
         // Get configuration
         audio_latency_compensation_ms_.store(
-            static_cast<int>(env::properties().get(L"configuration.portaudio.latency-compensation-ms", 40)));
+            static_cast<int>(env::properties().get(L"configuration.portaudio.latency-compensation-ms", 0)));
 
-        auto_tune_enabled_ = env::properties().get(L"configuration.portaudio.auto-tune-latency", false);
+        auto_tune_enabled_ = env::properties().get(L"configuration.portaudio.auto-tune-latency", true);
 
         output_channels_ = static_cast<int>(env::properties().get(L"configuration.portaudio.output-channels", 2));
 
         device_name_ = env::properties().get(L"configuration.portaudio.device-name", L"");
+
+        host_api_str_ = env::properties().get(L"configuration.portaudio.host-api", L"auto");
 
         buffer_size_frames_ =
             static_cast<unsigned long>(env::properties().get(L"configuration.portaudio.buffer-size-frames", 128));
@@ -714,22 +779,24 @@ class portaudio_consumer : public core::frame_consumer
 
         // CRITICAL: Do PortAudio initialization synchronously
         executor_.invoke([=] {
-            // Find ASIO device by name
-            device_index_ = find_device_by_name(device_name_);
+            // Resolve and find the configured host API
+            PaHostApiTypeId preferred_type = resolve_host_api_type(host_api_str_);
+            std::wstring    active_api_name;
+            int             api_index = find_best_host_api(preferred_type, active_api_name);
+
+            if (api_index < 0) {
+                CASPAR_LOG(error) << L"No usable PortAudio host API found.";
+                CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("No usable PortAudio host API found"));
+            }
+
+            CASPAR_LOG(info) << L"Using host API: " << active_api_name;
+
+            // Find device within the selected host API
+            device_index_ = find_device_by_name(device_name_, api_index);
 
             if (device_index_ < 0) {
-                CASPAR_LOG(error) << L"========================================";
-                CASPAR_LOG(error) << L"NO ASIO DEVICE AVAILABLE";
-                CASPAR_LOG(error) << L"========================================";
-                CASPAR_LOG(error) << L"PortAudio consumer requires ASIO for multi-channel output.";
-                CASPAR_LOG(error) << L"";
-                CASPAR_LOG(error) << L"Please install an ASIO driver:";
-                CASPAR_LOG(error) << L"  - Hardware ASIO (from your audio interface manufacturer)";
-                CASPAR_LOG(error) << L"  - ASIO4ALL (universal ASIO driver for any audio device)";
-                CASPAR_LOG(error) << L"  - FlexASIO (alternative universal ASIO driver)";
-                CASPAR_LOG(error) << L"========================================";
-
-                CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("No ASIO device available"));
+                CASPAR_LOG(error) << L"No usable output device found on host API: " << active_api_name;
+                CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("No usable output device found"));
             }
 
             // Setup PortAudio stream
@@ -742,12 +809,6 @@ class portaudio_consumer : public core::frame_consumer
 
             CASPAR_LOG(info) << L"Using PortAudio device: \"" << deviceInfo->name << L"\" ("
                              << (hostInfo ? hostInfo->name : "Unknown") << L")";
-
-            // Verify it's actually ASIO
-            if (hostInfo && hostInfo->type != paASIO) {
-                CASPAR_LOG(warning) << L"WARNING: Selected device is not ASIO! (Host API: " << hostInfo->name << L")";
-                CASPAR_LOG(warning) << L"Multi-channel output may not work correctly.";
-            }
 
             if (output_channels_ > deviceInfo->maxOutputChannels) {
                 CASPAR_LOG(warning) << L"Requested " << output_channels_ << L" channels but device only has "
@@ -765,22 +826,23 @@ class portaudio_consumer : public core::frame_consumer
             PaError sup                 = Pa_IsFormatSupported(nullptr, &outputParameters, desired_sample_rate);
 
             if (sup != paNoError) {
-                CASPAR_LOG(error) << L"========================================";
-                CASPAR_LOG(error) << L"ASIO SAMPLE RATE MISMATCH!";
-                CASPAR_LOG(error) << L"========================================";
-                CASPAR_LOG(error) << L"CasparCG wants: " << format_desc_.audio_sample_rate << L" Hz";
-                CASPAR_LOG(error) << L"ASIO driver error: " << Pa_GetErrorText(sup);
-                CASPAR_LOG(error) << L"";
-                CASPAR_LOG(error) << L"SOLUTION:";
-                CASPAR_LOG(error) << L"1. Open ASIO control panel for: " << deviceInfo->name;
-                CASPAR_LOG(error) << L"2. Set sample rate to: " << format_desc_.audio_sample_rate << L" Hz";
-                CASPAR_LOG(error) << L"3. Apply settings and restart CasparCG";
-                CASPAR_LOG(error) << L"========================================";
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
 
-                CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("ASIO sample rate mismatch"));
+                CASPAR_LOG(error) << L"Set your audio device sample rate to " << format_desc_.audio_sample_rate << L" Hz and restart CasparCG.";
+                CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Audio device sample rate mismatch"));
             }
 
-            CASPAR_LOG(info) << L"âœ“ ASIO format check passed: " << format_desc_.audio_sample_rate << L" Hz";
+            CASPAR_LOG(info) << L"??? ASIO format check passed: " << format_desc_.audio_sample_rate << L" Hz";
 
             // Open stream
             PaError err = Pa_OpenStream(&stream_,
@@ -804,7 +866,7 @@ class portaudio_consumer : public core::frame_consumer
 
             CASPAR_LOG(info) << L"PortAudio stream opened:";
             CASPAR_LOG(info) << L"  Sample rate: " << streamInfo->sampleRate << L" Hz";
-            CASPAR_LOG(info) << L"  ASIO reported latency: " << pa_latency_ms << L" ms";
+            CASPAR_LOG(info) << L"  Reported latency: " << pa_latency_ms << L" ms";
             CASPAR_LOG(info) << L"  Buffer size: " << buffer_size_frames_ << L" frames ("
                              << (buffer_size_frames_ * 1000.0 / format_desc_.audio_sample_rate) << L" ms)";
 
@@ -845,7 +907,7 @@ class portaudio_consumer : public core::frame_consumer
                                            std::string("Failed to start PortAudio stream: ") + Pa_GetErrorText(err)));
             }
 
-            CASPAR_LOG(info) << L"âœ“ PortAudio ASIO stream started successfully";
+            CASPAR_LOG(info) << L"PortAudio stream started successfully";
         });
 
         // Start audio dispatch thread
