@@ -670,37 +670,37 @@ class oal_consumer : public core::frame_consumer
     {
         auto current_frame = frame_counter_.fetch_add(1) + 1;
 
-        // Calculate when this frame should be presented
+        // Extract and schedule audio BEFORE sleeping so the dispatch thread
+        // has the full frame duration to reach the pre-compensated target time.
+        // Scheduling after the sleep means target_time is already in the past.
+        if (frame.audio_data() && frame.audio_data().size() > 0) {
+            std::vector<int32_t> audio_data;
+            auto                 audio_array = frame.audio_data();
+            audio_data.assign(audio_array.begin(), audio_array.end());
+
+            executor_.begin_invoke([=] {
+                try {
+                    schedule_audio_for_frame(
+                        current_frame, audio_data, format_desc_.audio_sample_rate, format_desc_.audio_channels);
+                } catch (...) {
+                    CASPAR_LOG_CURRENT_EXCEPTION();
+                }
+            });
+        }
+
+        // Sleep until the video frame presentation time
         auto target_time =
             channel_start_time_ + std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::duration<double>(
                                       static_cast<double>(current_frame) * frame_duration_seconds_));
 
-        // Sleep until the right time to maintain proper frame rate
         auto now = std::chrono::high_resolution_clock::now();
         if (target_time > now) {
             std::this_thread::sleep_until(target_time);
         }
 
         executor_.begin_invoke([=] {
-            try {
-                // Process audio if present using our video-scheduled approach
-                if (frame.audio_data() && frame.audio_data().size() > 0) {
-                    // Extract audio data directly from the frame
-                    std::vector<int32_t> audio_data;
-                    auto                 audio_array = frame.audio_data();
-                    audio_data.assign(audio_array.begin(), audio_array.end());
-
-                    // Call our scheduling method directly
-                    schedule_audio_for_frame(
-                        current_frame, audio_data, format_desc_.audio_sample_rate, format_desc_.audio_channels);
-                }
-
-                graph_->set_value("tick-time", perf_timer_.elapsed() * format_desc_.fps * 0.5);
-                perf_timer_.restart();
-
-            } catch (...) {
-                CASPAR_LOG_CURRENT_EXCEPTION();
-            }
+            graph_->set_value("tick-time", perf_timer_.elapsed() * format_desc_.fps * 0.5);
+            perf_timer_.restart();
         });
 
         return make_ready_future(true);
