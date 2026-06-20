@@ -20,9 +20,7 @@
  */
 
 #ifdef _DEBUG
-#ifdef WIN32
 #include <crtdbg.h>
-#endif
 #endif
 
 #define NOMINMAX
