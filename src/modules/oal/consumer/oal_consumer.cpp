@@ -184,7 +184,7 @@ struct oal_consumer : public core::frame_consumer
     {
         stop_ = true;
 
-        executor_.invoke([=] {
+        executor_.invoke([=, this] {
             if (source_) {
                 alSourceStop(source_);
                 alDeleteSources(1, &source_);
@@ -201,7 +201,7 @@ struct oal_consumer : public core::frame_consumer
         channel_index_ = channel_info.index;
         graph_->set_text(print());
 
-        executor_.invoke([=] {
+        executor_.invoke([=, this] {
             AVChannelLayout from, to;
             av_channel_layout_default(&from, format_desc_.audio_channels);
             av_channel_layout_default(&to, 2); // stereo

@@ -662,7 +662,7 @@ class portaudio_consumer : public core::frame_consumer
         }
 
         // Clean up PortAudio
-        executor_.invoke([=] {
+        executor_.invoke([=, this] {
             if (stream_ != nullptr) {
                 Pa_StopStream(stream_);
                 Pa_CloseStream(stream_);
@@ -781,7 +781,7 @@ class portaudio_consumer : public core::frame_consumer
         graph_->set_text(print());
 
         // CRITICAL: Do PortAudio initialization synchronously
-        executor_.invoke([=] {
+        executor_.invoke([=, this] {
             // Resolve and find the configured host API
             PaHostApiTypeId preferred_type = resolve_host_api_type(host_api_str_);
             std::wstring    active_api_name;
@@ -934,7 +934,7 @@ class portaudio_consumer : public core::frame_consumer
         // Schedule audio IMMEDIATELY (before video sleep)
         // This gives dispatch thread time to process it ahead of video display
         if (has_audio && !audio_data.empty()) {
-            executor_.begin_invoke([=] {
+            executor_.begin_invoke([=, this] {
                 schedule_audio_for_frame(
                     current_frame, audio_data, format_desc_.audio_sample_rate, format_desc_.audio_channels);
             });
@@ -951,7 +951,7 @@ class portaudio_consumer : public core::frame_consumer
         }
 
         // Update diagnostics
-        executor_.begin_invoke([=] {
+        executor_.begin_invoke([=, this] {
             const float fifo_fill = (audio_fifo_.capacity() > 0) ? static_cast<float>(audio_fifo_.available_to_read()) /
                                                                        static_cast<float>(audio_fifo_.capacity())
                                                                  : 0.0f;
