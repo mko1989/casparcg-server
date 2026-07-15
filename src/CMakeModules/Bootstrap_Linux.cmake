@@ -64,8 +64,8 @@ if (ENABLE_HTML)
     else()
         casparcg_add_external_project(cef)
         ExternalProject_Add(cef
-            URL ${CASPARCG_DOWNLOAD_MIRROR}/cef/cef_binary_142.0.17+g60aac24+chromium-142.0.7444.176_linux64_minimal.tar.bz2
-            URL_HASH SHA256=1d89e19b2f446105f9a1fe6fdc96bced86249b5884241dcc4013b7c94dabf424
+            URL https://github.com/mko1989/highascg/releases/download/v.142/cef_binary_142.0.17%2Bg60aac24%2Bchromium-142.0.7444.176_linux64_minimal.tar.bz2 # WO-234: owner custom CEF (cef_build_minimal_no_root) - MUST be this exact asset
+            URL_HASH SHA256=2a03fa6b9da0e374fb318903d9502e098ac91ba2ec5be83e96ae076b5aa63cc9
             DOWNLOAD_DIR ${CASPARCG_DOWNLOAD_CACHE}
             CMAKE_ARGS -DUSE_SANDBOX=Off
             INSTALL_COMMAND ""
