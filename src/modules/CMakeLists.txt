@@ -9,6 +9,8 @@ add_subdirectory(decklink)
 add_subdirectory(screen)
 add_subdirectory(newtek)
 add_subdirectory(artnet)
+add_subdirectory(pixel)
+add_subdirectory(shm)
 
 if (ENABLE_HTML)
 	add_subdirectory(html)
