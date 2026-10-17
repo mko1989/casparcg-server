@@ -37,6 +37,13 @@
 
 #include <common/endian.h>
 
+// float/double args below still branch on OSC_HOST_*_ENDIAN; without this include neither is
+// defined and they fall through to a raw native (little-endian) copy (WO-613).
+#include "OscHostEndianness.h"
+#if !defined(OSC_HOST_LITTLE_ENDIAN) && !defined(OSC_HOST_BIG_ENDIAN)
+#error "OSC host endianness undefined: float/double OSC args would be written in native byte order"
+#endif
+
 #if defined(__WIN32__) || defined(WIN32)
 #include <malloc.h> // for alloca
 #else
