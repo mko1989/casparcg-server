@@ -348,6 +348,29 @@ class Decoder
     }
 };
 
+// HighAsCG WO-790: bwdif holds every frame back by one (it needs the next field) even for progressive frames under
+// deint=interlaced, so a seek waited for one more decoded frame before its first picture (~60 ms for 4K NotchLC on the
+// dev box). Streams that cannot be interlaced skip it: flagged progressive, or a progressive-only codec (NotchLC / HAP /
+// DXV report field_order "unknown"). Any other video stream (DV, unflagged files, cover art) keeps bwdif.
+static bool video_is_progressive(const AVFormatContext* ic)
+{
+    for (auto n = 0U; n < ic->nb_streams; ++n) {
+        const auto par = ic->streams[n]->codecpar;
+        if (par->codec_type != AVMEDIA_TYPE_VIDEO || par->field_order == AV_FIELD_PROGRESSIVE) {
+            continue;
+        }
+        switch (par->codec_id) {
+            case AV_CODEC_ID_NOTCHLC:
+            case AV_CODEC_ID_HAP:
+            case AV_CODEC_ID_DXV:
+                continue;
+            default:
+                return false;
+        }
+    }
+    return true;
+}
+
 struct Filter
 {
     std::shared_ptr<AVFilterGraph>  graph;
@@ -373,7 +396,7 @@ struct Filter
             auto deint = u8(
                 env::properties().get<std::wstring>(L"configuration.ffmpeg.producer.auto-deinterlace", L"interlaced"));
 
-            if (deint != "none") {
+            if (deint != "none" && !video_is_progressive(input.operator->())) {
                 filter_spec += (boost::format(",bwdif=mode=send_field:parity=auto:deint=%s") % deint).str();
             }
 
