@@ -59,38 +59,105 @@ extern "C" {
 
 #include <atomic>
 #include <cstdint>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <queue>
+#include <string>
 #include <thread>
 #include <vector>
 
 #include <AL/al.h>
 #include <AL/alc.h>
+#define AL_ALEXT_PROTOTYPES
+#include <AL/alext.h>
 
 namespace caspar { namespace oal {
 
 using namespace std::chrono_literals;
 
+// One OpenAL device + context per output device, shared by every consumer that resolves to it
+// (HighAsCG WO-847, the device/context half of upstream #1714 that 2.5.1 ships and the Enhanced
+// OAL consumer lacked). Before: each consumer opened its own device and made its context
+// current PROCESS-WIDE with alcMakeContextCurrent, so with two <system-audio> consumers the
+// second one's context received every AL call of the first (same source / buffer names), and a
+// second consumer on an already open ALSA device failed with "Failed to initialize audio device".
+// Now each thread that talks to OpenAL selects the consumer's context with alcSetThreadContext
+// (ALC_EXT_thread_local_context), and consumers on the same device share it with one source each.
 class device
 {
-    ALCdevice*         device_  = nullptr;
-    ALCcontext*        context_ = nullptr;
-    const std::wstring device_name_;
+    ALCdevice*  device_       = nullptr;
+    ALCcontext* context_      = nullptr;
+    bool        thread_local_ = false;
+    std::string name_;
+
+    explicit device(const ALCchar* name)
+        : name_(name ? name : "")
+    {
+        device_ = alcOpenDevice(name);
+        if (!device_) CASPAR_THROW_EXCEPTION(invalid_operation() << msg_info("Failed to initialize audio device."));
+
+        context_ = alcCreateContext(device_, nullptr);
+        if (!context_) {
+            alcCloseDevice(device_);
+            CASPAR_THROW_EXCEPTION(invalid_operation() << msg_info("Failed to create audio context."));
+        }
+
+        thread_local_ = alcIsExtensionPresent(device_, "ALC_EXT_thread_local_context") == ALC_TRUE;
+        if (!thread_local_) {
+            CASPAR_LOG(warning) << L"OpenAL: ALC_EXT_thread_local_context missing, using the process-wide "
+                                   L"context (only one system-audio device can play)";
+            if (!alcMakeContextCurrent(context_)) {
+                alcDestroyContext(context_);
+                alcCloseDevice(device_);
+                CASPAR_THROW_EXCEPTION(invalid_operation() << msg_info("Failed to activate audio context."));
+            }
+        }
+    }
+
+    static std::mutex&                                  registry_mutex()
+    {
+        static std::mutex m;
+        return m;
+    }
+    static std::map<std::string, std::weak_ptr<device>>& registry()
+    {
+        static std::map<std::string, std::weak_ptr<device>> r;
+        return r;
+    }
 
   public:
-    explicit device(std::wstring device_name) : device_name_(std::move(device_name))
-    {
-        ALCchar* deviceName = nullptr;
+    device(const device&)            = delete;
+    device& operator=(const device&) = delete;
 
-        if (!device_name_.empty()) {
+    ~device()
+    {
+        if (thread_local_) {
+            if (alcGetThreadContext() == context_)
+                alcSetThreadContext(nullptr);
+        } else if (alcGetCurrentContext() == context_) {
+            alcMakeContextCurrent(nullptr);
+        }
+        if (context_) alcDestroyContext(context_);
+        if (device_)  alcCloseDevice(device_);
+    }
+
+    // Resolve the configured name like before (space-insensitive match against the OpenAL list,
+    // unknown name -> default device) and return the shared device for the resolved name.
+    static std::shared_ptr<device> open(const std::wstring& requested)
+    {
+        std::lock_guard<std::mutex> lock(registry_mutex());
+
+        const ALCchar* name = nullptr;
+        if (!requested.empty()) {
             if (alcIsExtensionPresent(nullptr, "ALC_ENUMERATION_EXT")) {
                 auto s = alcGetString(nullptr, alcIsExtensionPresent(nullptr, "ALC_ENUMERATE_ALL_EXT")
                     ? ALC_ALL_DEVICES_SPECIFIER
                     : ALC_DEVICE_SPECIFIER
                 );
-                deviceName = iterate_and_find_device(s, device_name_);
+                name = iterate_and_find_device(s, requested);
 
-                if (deviceName)
+                if (name)
                     CASPAR_LOG(debug) << L"Found specified OpenAL output device";
                 else
                     CASPAR_LOG(warning) << L"Failed to find specified OpenAL output device. Using default device";
@@ -99,29 +166,41 @@ class device
             }
         }
 
-        device_ = alcOpenDevice(deviceName);
-        if (!device_) CASPAR_THROW_EXCEPTION(invalid_operation() << msg_info("Failed to initialize audio device."));
-
-        context_ = alcCreateContext(device_, nullptr);
-        if (!context_) CASPAR_THROW_EXCEPTION(invalid_operation() << msg_info("Failed to create audio context."));
-
-        if (!alcMakeContextCurrent(context_))
-            CASPAR_THROW_EXCEPTION(invalid_operation() << msg_info("Failed to activate audio context."));
+        auto  key    = std::string(name ? name : "");
+        auto& weak   = registry()[key];
+        auto  shared = weak.lock();
+        if (shared) {
+            CASPAR_LOG(info) << L"OpenAL: sharing the already open device "
+                             << (key.empty() ? std::wstring(L"(default)") : u16(key));
+            return shared;
+        }
+        shared = std::shared_ptr<device>(new device(name));
+        weak   = shared;
+        return shared;
     }
 
-    ~device()
+    // Select this device's context for the calling thread. Every AL call of a consumer runs on its
+    // initialize/teardown executor or on the channel's output thread; both call this first.
+    void activate()
     {
-        alcMakeContextCurrent(nullptr);
-        if (context_) alcDestroyContext(context_);
-        if (device_)  alcCloseDevice(device_);
+        if (thread_local_) {
+            if (alcGetThreadContext() != context_)
+                alcSetThreadContext(context_);
+        } else if (alcGetCurrentContext() != context_) {
+            alcMakeContextCurrent(context_);
+        }
     }
 
-    ALCdevice* get() { return device_; }
+    void deactivate()
+    {
+        if (thread_local_ && alcGetThreadContext() == context_)
+            alcSetThreadContext(nullptr);
+    }
 
   private:
-    static ALCchar* iterate_and_find_device(const char* list, const std::wstring& device_name)
+    static const ALCchar* iterate_and_find_device(const char* list, const std::wstring& device_name)
     {
-        ALCchar* result = nullptr;
+        const ALCchar* result = nullptr;
 
         std::string short_device_name = u8(device_name);
         boost::algorithm::erase_all(short_device_name, " ");
@@ -131,7 +210,7 @@ class device
         if (!list) {
             CASPAR_LOG(info) << L"No device names found";
         } else {
-            ALCchar* ptr = (ALCchar*)list;
+            const ALCchar* ptr = list;
             while (strlen(ptr) > 0) {
                 CASPAR_LOG(info) << ptr;
 
@@ -157,7 +236,7 @@ struct oal_consumer : public core::frame_consumer
 
     core::video_format_desc format_desc_;
 
-    device              device_;
+    std::shared_ptr<device> device_;
     ALuint              source_ = 0;
     std::vector<ALuint> buffers_;
     std::queue<ALuint>  free_;
@@ -172,7 +251,7 @@ struct oal_consumer : public core::frame_consumer
     executor executor_{L"oal_consumer"};
 
   public:
-    explicit oal_consumer(std::wstring device_name) : device_{std::move(device_name)}
+    explicit oal_consumer(const std::wstring& device_name) : device_{device::open(device_name)}
     {
         graph_->set_color("tick-time", diagnostics::color(0.0f, 0.6f, 0.9f));
         graph_->set_color("dropped-frame", diagnostics::color(0.3f, 0.6f, 0.3f));
@@ -186,9 +265,11 @@ struct oal_consumer : public core::frame_consumer
 
         executor_.invoke([=, this] {
             if (source_) {
+                device_->activate();
                 alSourceStop(source_);
                 alDeleteSources(1, &source_);
                 alDeleteBuffers(static_cast<ALsizei>(buffers_.size()), buffers_.data());
+                device_->deactivate();
             }
         });
     }
@@ -215,6 +296,7 @@ struct oal_consumer : public core::frame_consumer
             swr_.reset(raw);
             swr_init(raw);
 
+            device_->activate();
             buffers_.resize(4);
             alGenBuffers(static_cast<ALsizei>(buffers_.size()), buffers_.data());
             for (auto buf : buffers_) free_.push(buf);
@@ -242,6 +324,14 @@ struct oal_consumer : public core::frame_consumer
         // screen consumer and OAL frame-accurately synchronized with no
         // additional threads.
         return std::async(std::launch::deferred, [this, frame = std::move(frame)] {
+            // This consumer's context on this channel's output thread for this frame only (WO-847);
+            // released on return so a channel thread never exits holding it.
+            device_->activate();
+            struct release_context
+            {
+                device& d;
+                ~release_context() { d.deactivate(); }
+            } release{*device_};
 
             // Step 1: reclaim any buffers OpenAL has already finished playing
             {
