@@ -97,7 +97,7 @@ struct configuration
     bool            high_bitdepth = false;
     bool            key_only      = false;
     bool            sbs_key       = false;
-    double          aspect_ratio  = 1.777; // Default 16:9; supports custom ratios via parse_aspect_ratio()
+    double          aspect_ratio  = 0.0; // 0.0 = auto: the format's square dimensions (stock / #1718 behaviour)
     bool            force_linear_filter = false;
     bool            enable_mipmaps      = false;
     bool            vsync               = false;
@@ -117,44 +117,44 @@ struct frame
     GLsync                         fence = nullptr;
 };
 
-// Aspect ratio accepts either a decimal value (e.g. 1.7778) or a colon-separated ratio (e.g. 16:9, 4:3).
-// Colon format is supported for backward compatibility with existing config files.
-// Decimal is the preferred format for custom ratios (e.g. 3.5556 for a 3840x1080 wall).
-// Falls back to 16:9 on invalid or out-of-range input.
+// Aspect ratio accepts a decimal value (e.g. 3.5556 for a 3840x1080 wall) or a "W:H" / "W/H" ratio
+// (e.g. 16:9, 3840:1080). Empty, "default" or invalid input returns 0.0 = auto: the channel format's
+// square dimensions, as stock CasparCG does (HighAsCG WO-847, from CasparCG/server#1718's final
+// version; the Enhanced fork fell back to a fixed 16:9, which squeezed every non-16:9 channel that
+// had no <width>/<height> or <aspect-ratio>, e.g. AMCP "ADD n SCREEN" on a 3840x1792 LED channel).
 double parse_aspect_ratio(const std::wstring& aspect_str)
 {
     if (aspect_str.empty() || aspect_str == L"default")
-        return 16.0 / 9.0;
+        return 0.0;
 
-    // Colon-separated format: "16:9", "4:3", or any "W:H" ratio
-    auto colon_pos = aspect_str.find(L':');
-    if (colon_pos != std::wstring::npos) {
+    auto sep_pos = aspect_str.find(L':');
+    if (sep_pos == std::wstring::npos)
+        sep_pos = aspect_str.find(L'/');
+    if (sep_pos != std::wstring::npos) {
         try {
-            double width  = std::stod(aspect_str.substr(0, colon_pos));
-            double height = std::stod(aspect_str.substr(colon_pos + 1));
-            if (height == 0.0) {
-                CASPAR_LOG(warning) << L"Invalid aspect ratio denominator, using default 16:9";
-                return 16.0 / 9.0;
+            double width  = std::stod(aspect_str.substr(0, sep_pos));
+            double height = std::stod(aspect_str.substr(sep_pos + 1));
+            if (height <= 0.0 || width <= 0.0) {
+                CASPAR_LOG(warning) << L"Invalid aspect ratio '" << aspect_str << L"', using auto";
+                return 0.0;
             }
             return width / height;
         } catch (...) {
-            CASPAR_LOG(warning) << L"Failed to parse aspect ratio '" << aspect_str << L"', using default 16:9";
-            return 16.0 / 9.0;
+            CASPAR_LOG(warning) << L"Failed to parse aspect ratio '" << aspect_str << L"', using auto";
+            return 0.0;
         }
     }
 
-    // Decimal format: "1.7778", "3.5556"
     try {
         double result = std::stod(aspect_str);
         if (result < 0.1 || result > 10.0) {
-            CASPAR_LOG(warning) << L"Aspect ratio " << aspect_str
-                                << L" out of reasonable range (0.1-10.0), using default 16:9";
-            return 16.0 / 9.0;
+            CASPAR_LOG(warning) << L"Aspect ratio " << aspect_str << L" out of reasonable range (0.1-10.0), using auto";
+            return 0.0;
         }
         return result;
     } catch (...) {
-        CASPAR_LOG(warning) << L"Failed to parse aspect ratio '" << aspect_str << L"', using default 16:9";
-        return 16.0 / 9.0;
+        CASPAR_LOG(warning) << L"Failed to parse aspect ratio '" << aspect_str << L"', using auto";
+        return 0.0;
     }
 }
 
@@ -226,9 +226,12 @@ struct screen_consumer
             CASPAR_LOG(info) << print() << L" Using frame copied to host for rendering.";
         }
 
-        // Calculate square dimensions based on custom aspect ratio
-        square_width_  = static_cast<int>(format_desc.height * config_.aspect_ratio);
-        square_height_ = format_desc.height;
+        // An explicit (or width/height-derived) aspect ratio overrides the format's square dimensions;
+        // auto (0.0) keeps them.
+        if (config_.aspect_ratio > 0.0) {
+            square_width_  = static_cast<int>(format_desc.height * config_.aspect_ratio);
+            square_height_ = format_desc.height;
+        }
 
         frame_buffer_.set_capacity(1);
 
@@ -536,8 +539,8 @@ struct screen_consumer
 
                 GL(glDisable(GL_DEPTH_TEST));
                 GL(glClearColor(0.0, 0.0, 0.0, 0.0));
-                GL(glViewport(
-                    0, 0, config_.sbs_key ? format_desc_.width * 2 : format_desc_.width, format_desc_.height));
+                // #1718 a0c5f9c99f: the window, not the channel format, is the render target.
+                GL(glViewport(0, 0, screen_width_, screen_height_));
 
                 calculate_aspect();
 
@@ -598,9 +601,9 @@ struct screen_consumer
             if (e.type == sf::Event::Resized) {
                 // Lock aspect ratio on resize when in windowed mode.
                 // In fullscreen mode the window size is fixed by the OS/display so this is a no-op.
-                if (config_.windowed && config_.aspect_ratio > 0.0) {
+                if (config_.windowed) {
                     unsigned int locked_height =
-                        static_cast<unsigned int>(e.size.width / config_.aspect_ratio);
+                        static_cast<unsigned int>(e.size.width / effective_aspect_ratio());
                     if (locked_height != e.size.height) {
                         window_.setSize(sf::Vector2u(e.size.width, locked_height));
                     }
@@ -720,10 +723,18 @@ struct screen_consumer
         }
     }
 
+    // The configured aspect ratio, or the format's square dimensions when it is auto (0.0).
+    double effective_aspect_ratio() const
+    {
+        if (config_.aspect_ratio > 0.0)
+            return config_.aspect_ratio;
+        return static_cast<double>(square_width_) / static_cast<double>(square_height_);
+    }
+
     // Aspect ratio calculations using double-based aspect ratio
     std::pair<float, float> uniform() const
     {
-        float aspect = static_cast<float>(config_.sbs_key ? config_.aspect_ratio * 2 : config_.aspect_ratio);
+        float aspect = static_cast<float>(config_.sbs_key ? effective_aspect_ratio() * 2 : effective_aspect_ratio());
         float width  = std::min(1.0f, static_cast<float>(screen_height_) * aspect / static_cast<float>(screen_width_));
         float height = static_cast<float>(screen_width_ * width) / static_cast<float>(screen_height_ * aspect);
 
@@ -732,7 +743,7 @@ struct screen_consumer
 
     std::pair<float, float> none() const
     {
-        float aspect = static_cast<float>(config_.sbs_key ? config_.aspect_ratio * 2 : config_.aspect_ratio);
+        float aspect = static_cast<float>(config_.sbs_key ? effective_aspect_ratio() * 2 : effective_aspect_ratio());
         float width  = aspect * static_cast<float>(format_desc_.height) / static_cast<float>(screen_width_);
         float height = static_cast<float>(format_desc_.height) / static_cast<float>(screen_height_);
 
@@ -743,7 +754,7 @@ struct screen_consumer
 
     std::pair<float, float> uniform_to_fill() const
     {
-        float aspect = static_cast<float>(config_.sbs_key ? config_.aspect_ratio * 2 : config_.aspect_ratio);
+        float aspect = static_cast<float>(config_.sbs_key ? effective_aspect_ratio() * 2 : effective_aspect_ratio());
         float wr     = aspect * static_cast<float>(format_desc_.height) / static_cast<float>(screen_width_);
         float hr     = static_cast<float>(format_desc_.height) / static_cast<float>(screen_height_);
         float r_inv  = 1.0f / std::min(wr, hr);
@@ -1147,7 +1158,7 @@ create_preconfigured_consumer(const boost::property_tree::wptree&               
         config.stretch = screen::stretch::uniform_to_fill;
     }
 
-    // Aspect ratio: explicit value, calculated from width/height, or default 16:9
+    // Aspect ratio: explicit value, calculated from width/height, or auto (0.0 = format square dimensions)
     auto aspect_str = ptree.get_optional<std::wstring>(L"aspect-ratio");
     if (aspect_str) {
         config.aspect_ratio = parse_aspect_ratio(*aspect_str);
@@ -1155,15 +1166,14 @@ create_preconfigured_consumer(const boost::property_tree::wptree&               
         config.aspect_ratio = static_cast<double>(config.screen_width) / static_cast<double>(config.screen_height);
         CASPAR_LOG(info) << L"Calculated aspect ratio " << std::fixed << std::setprecision(3) << config.aspect_ratio
                          << L" from dimensions " << config.screen_width << L"x" << config.screen_height;
-    } else {
-        config.aspect_ratio = 16.0 / 9.0;
     }
 
     config.force_linear_filter = ptree.get(L"force-linear-filter", false);
     config.enable_mipmaps      = ptree.get(L"enable-mipmaps", false);
 
     CASPAR_LOG(info) << L"Screen consumer configuration:";
-    CASPAR_LOG(info) << L"  aspect_ratio: " << config.aspect_ratio;
+    CASPAR_LOG(info) << L"  aspect_ratio: "
+                     << (config.aspect_ratio > 0.0 ? std::to_wstring(config.aspect_ratio) : std::wstring(L"auto (format)"));
     CASPAR_LOG(info) << L"  force_linear_filter: " << (config.force_linear_filter ? L"true" : L"false");
     CASPAR_LOG(info) << L"  enable_mipmaps: " << (config.enable_mipmaps ? L"true" : L"false");
     CASPAR_LOG(info) << L"  gpu_texture: " << (config.gpu_texture ? L"true" : L"false");
