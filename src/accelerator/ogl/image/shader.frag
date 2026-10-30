@@ -631,7 +631,8 @@ vec4 get_blurred_color(vec2 uv)
             float theta  = dither_theta + float(i) * 2.39996323;
             vec2  offset = vec2(cos(theta), sin(theta)) * radius * texelSize;
             vec4  col    = get_rgba_color(uv + offset);
-            float lum    = dot(col.rgb, vec3(0.299, 0.587, 0.114));
+            // col is BGR here (see apply_film_grain): Rec.709 on .bgr, the same luma as the grain
+            float lum    = dot(col.bgr, vec3(0.2126, 0.7152, 0.0722));
             float weight = 1.0 + pow(max(lum - 0.3, 0.0), 3.0) * 15.0;
             weight      *= mix(0.3, 1.0, t);
             totalColor  += col * weight;

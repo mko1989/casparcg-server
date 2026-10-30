@@ -73,12 +73,14 @@ void apply_transform_colour_values(core::image_transform& self, const core::imag
     if (other.blur.enable) {
         self.blur = other.blur;
     }
-    self.sharpen_amount += other.sharpen_amount;
-    if (other.sharpen_radius != 1.0)
-        self.sharpen_radius = other.sharpen_radius;
-    self.grain_intensity += other.grain_intensity;
-    if (other.grain_size != 1.0)
-        self.grain_size = other.grain_size;
+    // Shape parameters come from whichever transform has the effect on (a float test against the default
+    // misreads a tweened 0.9999999), strengths clamp to what one command accepts (CasparCG/server#1762 62fb8c2bf).
+    self.sharpen_amount = std::clamp(self.sharpen_amount + other.sharpen_amount, 0.0, 5.0);
+    if (other.sharpen_amount != 0.0)
+        self.sharpen_radius = std::clamp(other.sharpen_radius, 0.1, 10.0);
+    self.grain_intensity = std::clamp(self.grain_intensity + other.grain_intensity, 0.0, 1.0);
+    if (other.grain_intensity != 0.0)
+        self.grain_size = std::clamp(other.grain_size, 0.5, 10.0);
 }
 
 bool is_default_perspective(const core::corners& perspective)
