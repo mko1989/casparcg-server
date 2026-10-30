@@ -4,6 +4,7 @@ project (screen)
 set(SOURCES
 	consumer/screen_consumer.cpp
 	consumer/screen_consumer.h
+	consumer/slice_geometry.h
 	screen.cpp
 	screen.h
 )

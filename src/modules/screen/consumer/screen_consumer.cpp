@@ -57,6 +57,13 @@
 #include "../util/x11_util.h"
 #endif
 
+#include "slice_geometry.h"
+
+#include <cmath>
+#include <iomanip>
+#include <mutex>
+#include <sstream>
+
 #include "consumer_screen_fragment.h"
 #include "consumer_screen_vertex.h"
 #include <accelerator/ogl/util/shader.h>
@@ -106,6 +113,7 @@ struct configuration
     bool            always_on_top       = false;
     bool            gpu_texture         = false; // 2.5 feature
     colour_spaces   colour_space        = colour_spaces::RGB;
+    std::vector<slice> slices; // HighAsCG WO-869: src rect -> dst quad mappings onto the window canvas
 };
 
 struct frame
@@ -212,8 +220,27 @@ struct screen_consumer
     std::atomic<bool> visibility_change_requested_{false};
     std::atomic<bool> new_visibility_state_{true};
 
+    // Slices (HighAsCG WO-869). The canvas is the configured window size; dst corners are canvas pixels, so a
+    // resized window scales them by real/configured through the viewport. AMCP stores pending slices under
+    // the mutex; the render thread swaps them in at the top of its tick (no GL calls off the render thread).
+    int                       canvas_width_  = 0;
+    int                       canvas_height_ = 0;
+    std::mutex                slices_mutex_;
+    std::vector<slice>        pending_slices_;
+    std::atomic<bool>         slices_dirty_{false};
+    std::vector<slice>        active_slices_;
+    std::vector<slice_vertex> slice_vertices_;
+    bool                      slice_blend_ = false;
+
+    // Counters for INFO (screen/dropped_frames, screen/presented_frames).
+    std::atomic<std::int64_t> dropped_frames_{0};
+    std::atomic<std::int64_t> presented_frames_{0};
+
   public:
-    screen_consumer(const configuration& config, const core::video_format_desc& format_desc, int channel_index)
+    screen_consumer(const configuration&      config,
+                    const core::video_format_desc& format_desc,
+                    int                       channel_index,
+                    const std::vector<slice>& initial_slices = {})
         : config_(config)
         , format_desc_(format_desc)
         , channel_index_(channel_index)
@@ -428,6 +455,15 @@ struct screen_consumer
         CASPAR_LOG(info) << print() << L"   Size: " << screen_width_ << L"x" << screen_height_;
         CASPAR_LOG(info) << print() << L"   Windowed: " << (config_.windowed ? L"true" : L"false");
 
+        canvas_width_  = screen_width_;
+        canvas_height_ = screen_height_;
+        if (!initial_slices.empty()) {
+            std::string error;
+            if (!set_slices(initial_slices, error)) {
+                CASPAR_LOG(error) << print() << L" Slices ignored: " << u16(error);
+            }
+        }
+
         thread_ = std::thread([this] {
             try {
 #if SFML_VERSION_MAJOR >= 3
@@ -617,8 +653,151 @@ struct screen_consumer
         return count > 0;
     }
 
+    bool slices_supported() const
+    {
+        return !config_.sbs_key && !config_.key_only && config_.colour_space == configuration::colour_spaces::RGB;
+    }
+
+    // Validates (and clamps) a slice set against the channel raster and queues it for the render thread.
+    // An empty set returns to the normal stretch/fill draw. Called from the AMCP thread or the constructor.
+    bool set_slices(std::vector<slice> slices, std::string& error)
+    {
+        if (!slices_supported()) {
+            error = "slices cannot be combined with sbs-key, key-only or a datavideo colour-space";
+            return false;
+        }
+        if (!validate_slices(slices, format_desc_.width, format_desc_.height, error)) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(slices_mutex_);
+        pending_slices_ = std::move(slices);
+        slices_dirty_   = true;
+        return true;
+    }
+
+    // The latest accepted slice set (what the render thread shows from its next tick on).
+    std::vector<slice> requested_slices()
+    {
+        std::lock_guard<std::mutex> lock(slices_mutex_);
+        return pending_slices_;
+    }
+
+    // Render thread, top of every tick.
+    void apply_pending_slices()
+    {
+        if (!slices_dirty_.load()) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(slices_mutex_);
+            active_slices_ = pending_slices_;
+            slices_dirty_  = false;
+        }
+        slice_vertices_ = build_slice_vertices(
+            active_slices_, canvas_width_, canvas_height_, format_desc_.width, format_desc_.height);
+        slice_blend_ = slices_need_blend(active_slices_);
+        CASPAR_LOG(info) << print() << L" Slices active: " << active_slices_.size()
+                         << (slice_blend_ ? L" (blending)" : L"");
+    }
+
+    void draw_slices()
+    {
+        GL(glBindBuffer(GL_ARRAY_BUFFER, vbo_));
+        GL(glBufferData(GL_ARRAY_BUFFER,
+                        static_cast<GLsizeiptr>(sizeof(slice_vertex)) * slice_vertices_.size(),
+                        slice_vertices_.data(),
+                        GL_STATIC_DRAW));
+
+        auto stride = static_cast<GLsizei>(sizeof(slice_vertex));
+
+        struct attrib
+        {
+            const char* name;
+            GLint       size;
+            size_t      offset;
+        };
+        const attrib attribs[] = {{"Position", 2, offsetof(slice_vertex, x)},
+                                  {"TexCoordIn", 4, offsetof(slice_vertex, u)},
+                                  {"LocalIn", 2, offsetof(slice_vertex, lu)},
+                                  {"OpacityIn", 1, offsetof(slice_vertex, opacity)},
+                                  {"FeatherIn", 4, offsetof(slice_vertex, feather)},
+                                  {"SrcClampIn", 4, offsetof(slice_vertex, src_clamp)}};
+
+        std::vector<GLint> enabled;
+        for (auto& a : attribs) {
+            auto loc = shader_->get_attrib_location(a.name);
+            if (loc < 0) {
+                continue;
+            }
+            GL(glEnableVertexAttribArray(loc));
+            GL(glVertexAttribPointer(loc, a.size, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<GLvoid*>(a.offset)));
+            enabled.push_back(loc);
+        }
+
+        shader_->set("window_width", screen_width_);
+        shader_->set("key_only", false);
+        shader_->set("slice_mode", true);
+
+        GL(glDisable(GL_CULL_FACE));
+        if (slice_blend_) {
+            GL(glEnable(GL_BLEND));
+            GL(glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA));
+        }
+
+        // Slices without a clip are batched; a clipped slice is drawn on its own under glScissor. The clip is
+        // in canvas pixels, scaled to the real window like dst and flipped to GL's bottom-left origin.
+        const double sx    = static_cast<double>(screen_width_) / canvas_width_;
+        const double sy    = static_cast<double>(screen_height_) / canvas_height_;
+        size_t       first = 0;
+        auto         flush = [&](size_t end) {
+            if (end > first) {
+                GL(glDrawArrays(GL_TRIANGLES, static_cast<GLint>(first * 6), static_cast<GLsizei>((end - first) * 6)));
+            }
+            first = end;
+        };
+        for (size_t n = 0; n < active_slices_.size(); ++n) {
+            const auto& sl = active_slices_[n];
+            if (!sl.has_clip()) {
+                continue;
+            }
+            flush(n);
+            const auto x0 = std::lround(sl.clip[0] * sx);
+            const auto x1 = std::lround((sl.clip[0] + sl.clip[2]) * sx);
+            const auto y0 = std::lround(sl.clip[1] * sy);
+            const auto y1 = std::lround((sl.clip[1] + sl.clip[3]) * sy);
+            first         = n + 1;
+            if (x1 <= x0 || y1 <= y0) {
+                continue; // clip rounds to nothing
+            }
+            GL(glEnable(GL_SCISSOR_TEST));
+            GL(glScissor(static_cast<GLint>(x0),
+                         static_cast<GLint>(screen_height_ - y1),
+                         static_cast<GLsizei>(x1 - x0),
+                         static_cast<GLsizei>(y1 - y0)));
+            GL(glDrawArrays(GL_TRIANGLES, static_cast<GLint>(n * 6), 6));
+            GL(glDisable(GL_SCISSOR_TEST));
+        }
+        flush(active_slices_.size());
+
+        if (slice_blend_) {
+            GL(glDisable(GL_BLEND));
+        }
+        shader_->set("slice_mode", false);
+
+        for (auto loc : enabled) {
+            GL(glDisableVertexAttribArray(loc));
+        }
+
+        GL(glBindTexture(GL_TEXTURE_2D, 0));
+    }
+
     void draw()
     {
+        if (!active_slices_.empty()) {
+            draw_slices();
+            return;
+        }
+
         GL(glBindBuffer(GL_ARRAY_BUFFER, vbo_));
         GL(glBufferData(GL_ARRAY_BUFFER,
                         static_cast<GLsizeiptr>(sizeof(core::frame_geometry::coord)) * draw_coords_.size(),
@@ -660,6 +839,7 @@ struct screen_consumer
     std::future<bool> send(core::video_field field, const core::const_frame& frame)
     {
         if (!frame_buffer_.try_push(frame)) {
+            ++dropped_frames_;
             graph_->set_tag(diagnostics::tag_severity::WARNING, "dropped-frame");
         }
         return make_ready_future(is_running_.load());
@@ -846,6 +1026,8 @@ struct host_strategy : public display_strategy
 
     virtual void do_tick(screen_consumer* self) override
     {
+        self->apply_pending_slices();
+
         if (self->visibility_change_requested_.load()) {
             bool new_state = self->new_visibility_state_.load();
             self->window_.setVisible(new_state);
@@ -917,6 +1099,7 @@ struct host_strategy : public display_strategy
         }
 
         self->window_.display();
+        ++self->presented_frames_;
 
         std::rotate(self->frames_.begin(), self->frames_.begin() + 1, self->frames_.end());
 
@@ -946,6 +1129,8 @@ struct gpu_strategy : public display_strategy
 
     virtual void do_tick(screen_consumer* self) override
     {
+        self->apply_pending_slices();
+
         core::const_frame in_frame;
 
         self->poll();
@@ -992,6 +1177,7 @@ struct gpu_strategy : public display_strategy
         }
 
         self->window_.display();
+        ++self->presented_frames_;
 
         std::rotate(self->frames_.begin(), self->frames_.begin() + 1, self->frames_.end());
 
@@ -999,6 +1185,125 @@ struct gpu_strategy : public display_strategy
         self->tick_timer_.restart();
     }
 };
+
+// Parses numbers (wcstod: accepts nan/inf so that the caller can reject them by name).
+bool parse_slice_numbers(const std::vector<std::wstring>& tokens, std::vector<double>& out)
+{
+    out.clear();
+    for (auto& t : tokens) {
+        if (t.empty()) {
+            continue;
+        }
+        wchar_t* end   = nullptr;
+        double   value = std::wcstod(t.c_str(), &end);
+        if (end == t.c_str() || *end != L'\0') {
+            return false;
+        }
+        out.push_back(value);
+    }
+    return true;
+}
+
+// Whitespace-separated list of exactly `expected` finite numbers (XML <src>, <dst>, ...).
+bool parse_slice_text(const std::wstring& text, size_t expected, double* out)
+{
+    std::vector<std::wstring> tokens;
+    auto                      trimmed = boost::trim_copy(text);
+    boost::split(tokens, trimmed, boost::is_any_of(L" \t\r\n,"), boost::token_compress_on);
+    std::vector<double> values;
+    if (!parse_slice_numbers(tokens, values) || values.size() != expected) {
+        return false;
+    }
+    for (size_t n = 0; n < expected; ++n) {
+        if (!std::isfinite(values[n])) {
+            return false;
+        }
+        out[n] = values[n];
+    }
+    return true;
+}
+
+constexpr size_t slice_amcp_values = 21; // src 4, dst 8, opacity 1, feather 4, clip 4
+
+// APPLY <ch>-<index> SLICES SET <n> <21 numbers per slice> | SLICES CLEAR
+bool parse_slices_command(const std::vector<std::wstring>& params, std::vector<slice>& slices, std::string& error)
+{
+    slices.clear();
+    if (params.size() < 2 || !boost::iequals(params.at(0), L"SLICES")) {
+        error = "expected SLICES SET <n> ... or SLICES CLEAR";
+        return false;
+    }
+    if (boost::iequals(params.at(1), L"CLEAR")) {
+        if (params.size() != 2) {
+            error = "SLICES CLEAR takes no arguments";
+            return false;
+        }
+        return true;
+    }
+    if (!boost::iequals(params.at(1), L"SET") || params.size() < 3) {
+        error = "expected SLICES SET <n> ... or SLICES CLEAR";
+        return false;
+    }
+
+    std::vector<double> count;
+    if (!parse_slice_numbers({params.at(2)}, count) || count.size() != 1 || !std::isfinite(count[0]) ||
+        count[0] < 0 || count[0] != std::floor(count[0])) {
+        error = "slice count must be a non-negative integer";
+        return false;
+    }
+    if (count[0] > static_cast<double>(max_slices)) {
+        error = "more than " + std::to_string(max_slices) + " slices";
+        return false;
+    }
+    const auto n = static_cast<size_t>(count[0]);
+
+    std::vector<double> values;
+    if (!parse_slice_numbers(std::vector<std::wstring>(params.begin() + 3, params.end()), values)) {
+        error = "malformed number";
+        return false;
+    }
+    if (values.size() != n * slice_amcp_values) {
+        error = "expected " + std::to_string(n * slice_amcp_values) + " numbers (" +
+                std::to_string(slice_amcp_values) + " per slice), got " + std::to_string(values.size());
+        return false;
+    }
+    for (double v : values) {
+        if (!std::isfinite(v)) {
+            error = "non-finite number";
+            return false;
+        }
+    }
+
+    for (size_t i = 0; i < n; ++i) {
+        const double* v = values.data() + i * slice_amcp_values;
+        slice         sl;
+        std::copy(v, v + 4, sl.src);
+        std::copy(v + 4, v + 12, sl.dst);
+        sl.opacity = static_cast<float>(v[12]);
+        for (int k = 0; k < 4; ++k) {
+            sl.feather[k] = static_cast<float>(v[13 + k]);
+        }
+        std::copy(v + 17, v + 21, sl.clip);
+        slices.push_back(sl);
+    }
+    return true;
+}
+
+std::wstring describe_slice(const slice& s)
+{
+    std::wstringstream str;
+    str << std::fixed << std::setprecision(1) << L"src " << s.src[0] << L" " << s.src[1] << L" " << s.src[2] << L" "
+        << s.src[3] << L" dst";
+    for (double d : s.dst) {
+        str << L" " << d;
+    }
+    str << std::setprecision(2) << L" opacity " << s.opacity << std::setprecision(1) << L" feather " << s.feather[0]
+        << L" " << s.feather[1] << L" " << s.feather[2] << L" " << s.feather[3];
+    if (s.has_clip()) {
+        str << L" clip " << s.clip[0] << L" " << s.clip[1] << L" " << s.clip[2] << L" " << s.clip[3];
+    }
+    return str.str();
+}
 
 struct screen_consumer_proxy : public core::frame_consumer
 {
@@ -1015,8 +1320,27 @@ struct screen_consumer_proxy : public core::frame_consumer
                     const core::channel_info&      channel_info,
                     int                            port_index) override
     {
+        // A re-initialize (channel format change) keeps the live slice set, not the config baseline.
+        auto slices = consumer_ ? consumer_->requested_slices() : config_.slices;
         consumer_.reset();
-        consumer_ = std::make_unique<screen_consumer>(config_, format_desc, channel_info.index);
+        consumer_ = std::make_unique<screen_consumer>(config_, format_desc, channel_info.index, slices);
+    }
+
+    // AMCP APPLY (CasparCG/server#1638): APPLY <ch>-<index> SLICES SET <n> <21 numbers per slice> | SLICES CLEAR.
+    // Runs on the AMCP thread; it only validates and queues (no GL calls, no window recreation).
+    std::future<bool> call(const std::vector<std::wstring>& params) override
+    {
+        if (!consumer_) {
+            return make_ready_future(false);
+        }
+        std::vector<slice> slices;
+        std::string        error;
+        if (!parse_slices_command(params, slices, error) || !consumer_->set_slices(slices, error)) {
+            CASPAR_LOG(warning) << print() << L" APPLY rejected: " << u16(error);
+            return make_ready_future(false);
+        }
+        CASPAR_LOG(info) << print() << L" APPLY SLICES: " << slices.size() << L" slice(s) queued.";
+        return make_ready_future(true);
     }
 
     std::future<bool> send(core::video_field field, core::const_frame frame) override
@@ -1040,6 +1364,20 @@ struct screen_consumer_proxy : public core::frame_consumer
         state["screen/key_only"]      = config_.key_only;
         state["screen/always_on_top"] = config_.always_on_top;
         state["screen/gpu_texture"]   = config_.gpu_texture;
+        if (consumer_) {
+            state["screen/dropped_frames"]   = consumer_->dropped_frames_.load();
+            state["screen/presented_frames"] = consumer_->presented_frames_.load();
+            auto slices            = consumer_->requested_slices();
+            state["screen/slices"] = static_cast<std::int32_t>(slices.size());
+            for (size_t n = 0; n < slices.size(); ++n) {
+                const auto& sl                      = slices[n];
+                state["screen/slice"][n]["src"]     = std::vector<double>(sl.src, sl.src + 4);
+                state["screen/slice"][n]["dst"]     = std::vector<double>(sl.dst, sl.dst + 8);
+                state["screen/slice"][n]["opacity"] = sl.opacity;
+                state["screen/slice"][n]["feather"] = std::vector<float>(sl.feather, sl.feather + 4);
+                state["screen/slice"][n]["clip"]    = std::vector<double>(sl.clip, sl.clip + 4);
+            }
+        }
         return state;
     }
 };
@@ -1171,6 +1509,53 @@ create_preconfigured_consumer(const boost::property_tree::wptree&               
     config.force_linear_filter = ptree.get(L"force-linear-filter", false);
     config.enable_mipmaps      = ptree.get(L"enable-mipmaps", false);
 
+    // <slices><slice><src>x y w h</src><dst>ulx uly urx ury lrx lry llx lly</dst><opacity>1</opacity>
+    // <feather>l t r b</feather><clip>x y w h</clip></slice>...</slices> (HighAsCG WO-869). A malformed slice
+    // drops the whole set; the raster checks (convex quad, src inside the channel) run at initialize.
+    if (auto slices_tree = ptree.get_child_optional(L"slices")) {
+        std::vector<slice> slices;
+        bool               ok = true;
+        for (auto& xml_slice : *slices_tree) {
+            if (xml_slice.first != L"slice") {
+                continue;
+            }
+            const auto& t          = xml_slice.second;
+            slice       sl;
+            double      opacity    = 1.0;
+            double      feather[4] = {0, 0, 0, 0};
+            if (!parse_slice_text(t.get(L"src", L""), 4, sl.src) || !parse_slice_text(t.get(L"dst", L""), 8, sl.dst) ||
+                (t.get_optional<std::wstring>(L"opacity") && !parse_slice_text(t.get(L"opacity", L""), 1, &opacity)) ||
+                (t.get_optional<std::wstring>(L"feather") && !parse_slice_text(t.get(L"feather", L""), 4, feather)) ||
+                (t.get_optional<std::wstring>(L"clip") && !parse_slice_text(t.get(L"clip", L""), 4, sl.clip))) {
+                CASPAR_LOG(error) << L"Screen consumer: slice " << slices.size()
+                                  << L" is malformed (<src> needs 4 numbers, <dst> 8, <opacity> 1, <feather> 4, "
+                                     L"<clip> 4).";
+                ok = false;
+                break;
+            }
+            sl.opacity = static_cast<float>(opacity);
+            for (int k = 0; k < 4; ++k) {
+                sl.feather[k] = static_cast<float>(feather[k]);
+            }
+            slices.push_back(sl);
+        }
+        if (ok && slices.size() > max_slices) {
+            CASPAR_LOG(error) << L"Screen consumer: more than " << max_slices << L" slices.";
+            ok = false;
+        }
+        if (ok && !slices.empty() &&
+            (config.sbs_key || config.key_only || config.colour_space != configuration::colour_spaces::RGB)) {
+            CASPAR_LOG(error) << L"Screen consumer: <slices> cannot be combined with sbs-key, key-only or a "
+                                 L"datavideo colour-space.";
+            ok = false;
+        }
+        if (ok) {
+            config.slices = std::move(slices);
+        } else {
+            CASPAR_LOG(error) << L"Screen consumer: <slices> ignored.";
+        }
+    }
+
     CASPAR_LOG(info) << L"Screen consumer configuration:";
     CASPAR_LOG(info) << L"  aspect_ratio: "
                      << (config.aspect_ratio > 0.0 ? std::to_wstring(config.aspect_ratio) : std::wstring(L"auto (format)"));
@@ -1178,6 +1563,10 @@ create_preconfigured_consumer(const boost::property_tree::wptree&               
     CASPAR_LOG(info) << L"  enable_mipmaps: " << (config.enable_mipmaps ? L"true" : L"false");
     CASPAR_LOG(info) << L"  gpu_texture: " << (config.gpu_texture ? L"true" : L"false");
     CASPAR_LOG(info) << L"  high_bitdepth: " << (config.high_bitdepth ? L"true" : L"false");
+    CASPAR_LOG(info) << L"  slices: " << config.slices.size();
+    for (size_t n = 0; n < config.slices.size(); ++n) {
+        CASPAR_LOG(info) << L"    slice " << n << L": " << describe_slice(config.slices[n]);
+    }
 
     return spl::make_shared<screen_consumer_proxy>(config);
 }
