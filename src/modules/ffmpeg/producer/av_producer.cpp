@@ -858,6 +858,10 @@ struct AVProducer::Impl
 
     int                              seekable_ = 2;
     core::frame_geometry::scale_mode scale_mode_;
+
+    // HighAsCG: the last video-only frame made, kept to recognise fps-filter duplicates (same refcounted buffer).
+    std::shared_ptr<AVFrame> prev_video_;
+    core::draw_frame         prev_draw_;
     int64_t                          frame_count_    = 0;
     bool                             frame_flush_    = true;
     int64_t                          frame_time_     = AV_NOPTS_VALUE;
@@ -1104,8 +1108,28 @@ struct AVProducer::Impl
                 frame.duration   = av_rescale_q(frame.audio->nb_samples, {1, sr}, TIME_BASE_Q);
             }
 
-            frame.frame = core::draw_frame(
-                make_frame(this, *frame_factory_, frame.video, frame.audio, get_color_space(frame.video), scale_mode_));
+            // HighAsCG: a 25/30p clip on a 50p channel gets every picture twice from the fps filter, as a new AVFrame
+            // on the SAME refcounted buffer. Reuse the frame already made for it: it keeps its GPU textures (made at
+            // commit, image_mixer), so the host copy, the upload and a NotchLC GPU decode are skipped. prev_video_
+            // holds a reference, so an equal data pointer cannot be a recycled buffer. Video-only frames only: an
+            // audio frame carries this output frame's own samples.
+            const bool dup = frame.video && !frame.audio && prev_video_ && static_cast<bool>(prev_draw_) &&
+                             frame.video->data[0] == prev_video_->data[0] &&
+                             frame.video->format == prev_video_->format && frame.video->width == prev_video_->width &&
+                             frame.video->height == prev_video_->height;
+            if (dup) {
+                frame.frame = prev_draw_;
+            } else {
+                frame.frame = core::draw_frame(make_frame(
+                    this, *frame_factory_, frame.video, frame.audio, get_color_space(frame.video), scale_mode_));
+                if (frame.video && !frame.audio) {
+                    prev_video_ = frame.video;
+                    prev_draw_  = frame.frame;
+                } else {
+                    prev_video_.reset();
+                    prev_draw_ = core::draw_frame{};
+                }
+            }
             frame.frame_count = frame_count_++;
 
             graph_->set_value("decode-time", decode_timer.elapsed() * format_desc_.fps * 0.5);

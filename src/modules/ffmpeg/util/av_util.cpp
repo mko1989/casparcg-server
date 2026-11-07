@@ -94,11 +94,20 @@ core::mutable_frame make_frame(void*                            tag,
                 for (int n = 0; n < static_cast<int>(pix_desc.planes.size()); ++n) {
                     auto frame_plan_index = data_map.empty() ? n : data_map.at(n);
 
-                    tbb::parallel_for(0, pix_desc.planes[n].height, [&](int y) {
-                        std::memcpy(frame.image_data(n).begin() + y * pix_desc.planes[n].linesize,
-                                    video->data[frame_plan_index] + y * video->linesize[frame_plan_index],
-                                    pix_desc.planes[n].linesize);
-                    });
+                    // HighAsCG: plain copies, no per-row tbb::parallel_for. One task per row woke the whole TBB
+                    // pool for every frame (15 spinning workers ≈ 72 % of a core for 4K at 50 fps vs 16 % serial,
+                    // ProRes study 07.11); a 4K frame copies in ~3 ms on one core, well inside the producer buffer.
+                    const auto  dst_ls = pix_desc.planes[n].linesize;
+                    const auto  src_ls = video->linesize[frame_plan_index];
+                    const auto  rows   = pix_desc.planes[n].height;
+                    auto        dst    = frame.image_data(n).begin();
+                    const auto* src    = video->data[frame_plan_index];
+                    if (src_ls == dst_ls) {
+                        std::memcpy(dst, src, static_cast<size_t>(dst_ls) * rows);
+                    } else {
+                        for (int y = 0; y < rows; ++y)
+                            std::memcpy(dst + static_cast<size_t>(y) * dst_ls, src + static_cast<size_t>(y) * src_ls, dst_ls);
+                    }
                 }
             }
         },
