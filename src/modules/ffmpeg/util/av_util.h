@@ -34,6 +34,8 @@ core::pixel_format_desc pixel_format_desc(AVPixelFormat     pix_fmt,
                                           core::color_space color_space = core::color_space::bt709);
 // HighAsCG WO-820: AVFrame metadata key that marks a NotchLC payload frame (see notchlc_unpack.h).
 constexpr const char* NOTCHLC_PAYLOAD_TAG = "highascg_notchlc_payload";
+// HighAsCG WO-993: same idea for DXV (core/frame/dxv.h), decoded on the GPU by the mixer.
+constexpr const char* DXV_PAYLOAD_TAG = "highascg_dxv_payload";
 
 core::mutable_frame     make_frame(void*                    tag,
                                    core::frame_factory&     frame_factory,

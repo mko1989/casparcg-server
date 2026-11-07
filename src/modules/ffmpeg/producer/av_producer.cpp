@@ -4,6 +4,7 @@
 
 #include "../util/av_assert.h"
 #include "../util/av_util.h"
+#include "../util/dxv_unpack.h"
 #include "../util/notchlc_unpack.h"
 
 #include <boost/exception/exception.hpp>
@@ -25,6 +26,7 @@
 
 #include <core/frame/draw_frame.h>
 #include <core/frame/frame_factory.h>
+#include <core/frame/dxv.h>
 #include <core/frame/notchlc.h>
 #include <core/monitor/monitor.h>
 
@@ -159,6 +161,78 @@ class Decoder
     bool                          nlc_eof_    = false;
     bool                          nlc_warned_ = false;
 
+    // HighAsCG WO-993: DXV GPU path, same shape. The decoder only undoes DXV's own compression (dxv_unpack) down to raw
+    // BC blocks and hands over a GRAY8 payload frame (core/frame/dxv.h, tagged DXV_PAYLOAD_TAG). Shares the pool,
+    // pending packet and eof flag above.
+    bool                                 dxv_gpu_    = false;
+    bool                                 dxv_warned_ = false;
+    int                                  dxv_w_ = 0, dxv_h_ = 0, dxv_cw_ = 0, dxv_ch_ = 0;
+    std::shared_ptr<dxv::scratch>        dxv_s_;
+    std::vector<uint8_t>                 dxv_tex_, dxv_ctex_; // kept across packets, as FFmpeg keeps tex_data
+    bool payload_gpu_() const { return notchlc_gpu_ || dxv_gpu_; }
+
+    int dxv_receive(AVFrame* f)
+    {
+        if (!nlc_pending_) {
+            return nlc_eof_ ? AVERROR_EOF : AVERROR(EAGAIN);
+        }
+        auto pkt = std::move(nlc_pending_);
+        nlc_pending_.reset();
+
+        f->buf[0] = av_buffer_pool_get(nlc_pool_.get());
+        if (!f->buf[0]) {
+            return AVERROR(ENOMEM);
+        }
+        f->data[0]     = f->buf[0]->data;
+        f->linesize[0] = core::dxv::row_words * 4;
+        f->width       = ctx->width;
+        f->height      = ctx->height;
+        f->format      = AV_PIX_FMT_GRAY8;
+
+        namespace cd = core::dxv;
+        dxv::layout lay;
+        std::string error;
+        bool        ok = dxv::unpack(pkt->data, pkt->size, dxv_cw_, dxv_ch_, lay, dxv_tex_, dxv_ctex_, *dxv_s_, error);
+        const size_t tex_off  = cd::header_words * 4;
+        const size_t ctex_off = tex_off + (lay.tex_size + 3) / 4 * 4;
+        const size_t used     = ctex_off + lay.ctex_size;
+        if (ok && used + 16 > nlc_bytes_) {
+            ok    = false;
+            error = "payload larger than the plane";
+        }
+        uint32_t h[cd::header_words] = {};
+        h[cd::h_magic]  = cd::magic;
+        h[cd::h_width]  = static_cast<uint32_t>(dxv_w_);
+        h[cd::h_height] = static_cast<uint32_t>(dxv_h_);
+        h[cd::h_coded_w] = static_cast<uint32_t>(dxv_cw_);
+        h[cd::h_coded_h] = static_cast<uint32_t>(dxv_ch_);
+        h[cd::h_used]   = static_cast<uint32_t>(tex_off);
+        if (ok) {
+            h[cd::h_valid]  = 1;
+            h[cd::h_format] = lay.fmt == dxv::tex_format::dxt1   ? cd::fmt_dxt1
+                              : lay.fmt == dxv::tex_format::dxt5 ? cd::fmt_dxt5
+                              : lay.fmt == dxv::tex_format::ycg6 ? cd::fmt_ycg6
+                                                                 : cd::fmt_yg10;
+            h[cd::h_tex]    = static_cast<uint32_t>(tex_off / 4);
+            h[cd::h_ctex]   = lay.ctex_size ? static_cast<uint32_t>(ctex_off / 4) : 0;
+            h[cd::h_used]   = static_cast<uint32_t>(used);
+            std::memcpy(f->data[0] + tex_off, dxv_tex_.data(), lay.tex_size);
+            if (lay.ctex_size)
+                std::memcpy(f->data[0] + ctex_off, dxv_ctex_.data(), lay.ctex_size);
+        } else if (!dxv_warned_) {
+            dxv_warned_ = true;
+            CASPAR_LOG(warning) << L"[ffmpeg] DXV GPU path: undecodable frame (" << u16(error)
+                                << L"), drawn transparent. Further errors are not logged.";
+        }
+        std::memcpy(f->data[0], h, sizeof(h));
+        av_dict_set(&f->metadata, DXV_PAYLOAD_TAG, "1", 0);
+        f->best_effort_timestamp = pkt->pts != AV_NOPTS_VALUE ? pkt->pts : pkt->dts;
+        f->pts                   = f->best_effort_timestamp;
+        f->duration              = pkt->duration;
+        f->sample_aspect_ratio   = ctx->sample_aspect_ratio;
+        return 0;
+    }
+
     int notchlc_receive(AVFrame* f)
     {
         if (!nlc_pending_) {
@@ -197,7 +271,7 @@ class Decoder
 
     Decoder() = default;
 
-    bool notchlc_gpu() const { return notchlc_gpu_; }
+    bool payload_gpu() const { return payload_gpu_(); } // NotchLC / DXV payload frames (GPU decode)
 
     explicit Decoder(AVStream* stream, bool allow_notchlc_gpu = false)
         : st(stream)
@@ -247,6 +321,27 @@ class Decoder
                               << L": GPU decode (WO-820), payload plane " << ctx->width << L"x" << ctx->height;
         }
 
+        // HighAsCG WO-993: DXV is decoded on the GPU unless <ffmpeg><producer><dxv-gpu>false or a user video filter is
+        // set. FFmpeg codes FFALIGN(size, 4) and needs a coded height of at least 8.
+        if (allow_notchlc_gpu && ctx->codec_id == AV_CODEC_ID_DXV && ctx->width > 0 && ctx->height > 0 &&
+            FFALIGN(ctx->height, 4) >= 8 && env::properties().get(L"configuration.ffmpeg.producer.dxv-gpu", true)) {
+            dxv_gpu_     = true;
+            dxv_w_       = ctx->width;
+            dxv_h_       = ctx->height;
+            dxv_cw_      = FFALIGN(ctx->width, 4);
+            dxv_ch_      = FFALIGN(ctx->height, 4);
+            dxv_s_       = std::make_shared<dxv::scratch>();
+            ctx->width   = core::dxv::row_words * 4;
+            ctx->height  = core::dxv::plane_rows(dxv_cw_, dxv_ch_);
+            ctx->pix_fmt = AV_PIX_FMT_GRAY8;
+            nlc_bytes_   = static_cast<size_t>(ctx->width) * ctx->height;
+            nlc_pool_    = std::shared_ptr<AVBufferPool>(
+                av_buffer_pool_init(nlc_bytes_ + AV_INPUT_BUFFER_PADDING_SIZE, nullptr),
+                [](AVBufferPool* p) { av_buffer_pool_uninit(&p); });
+            CASPAR_LOG(debug) << L"[ffmpeg] DXV " << dxv_w_ << L"x" << dxv_h_
+                              << L": GPU decode (WO-993), payload plane " << ctx->width << L"x" << ctx->height;
+        }
+
         if (ctx->codec_type == AVMEDIA_TYPE_VIDEO) {
             ctx->framerate           = av_guess_frame_rate(nullptr, stream, nullptr);
             ctx->sample_aspect_ratio = av_guess_sample_aspect_ratio(nullptr, stream, nullptr);
@@ -261,7 +356,7 @@ class Decoder
 #endif
         }
 
-        if (!notchlc_gpu_) {
+        if (!payload_gpu_()) {
             FF(avcodec_open2(ctx.get(), codec, nullptr));
         }
 
@@ -270,7 +365,8 @@ class Decoder
                 while (!thread.interruption_requested()) {
                     auto av_frame = alloc_frame();
                     auto ret      = notchlc_gpu_ ? notchlc_receive(av_frame.get())
-                                             : avcodec_receive_frame(ctx.get(), av_frame.get());
+                                    : dxv_gpu_   ? dxv_receive(av_frame.get())
+                                                 : avcodec_receive_frame(ctx.get(), av_frame.get());
 
                     if (ret == AVERROR(EAGAIN)) {
                         std::shared_ptr<AVPacket> packet;
@@ -280,14 +376,14 @@ class Decoder
                             packet = std::move(input.front());
                             input.pop();
                         }
-                        if (notchlc_gpu_) {
+                        if (payload_gpu_()) {
                             nlc_eof_     = !packet;
                             nlc_pending_ = std::move(packet);
                         } else {
                             FF(avcodec_send_packet(ctx.get(), packet.get()));
                         }
                     } else if (ret == AVERROR_EOF) {
-                        if (!notchlc_gpu_) {
+                        if (!payload_gpu_()) {
                             avcodec_flush_buffers(ctx.get());
                         }
                         av_frame->pts = next_pts;
@@ -641,7 +737,7 @@ struct Filter
                 }
 
                 auto st = it->second.ctx;
-                if (st->codec_type == AVMEDIA_TYPE_VIDEO && it->second.notchlc_gpu()) {
+                if (st->codec_type == AVMEDIA_TYPE_VIDEO && it->second.payload_gpu()) {
                     notchlc_gpu = true;
                 }
 

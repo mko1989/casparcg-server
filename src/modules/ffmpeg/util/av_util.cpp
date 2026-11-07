@@ -2,6 +2,7 @@
 #include "av_assert.h"
 
 #include <common/bit_depth.h>
+#include <core/frame/dxv.h>
 #include <core/frame/notchlc.h>
 
 #if defined(_MSC_VER)
@@ -62,8 +63,14 @@ core::mutable_frame make_frame(void*                            tag,
     const bool notchlc_payload =
         video && video->format == AV_PIX_FMT_GRAY8 && av_dict_get(video->metadata, NOTCHLC_PAYLOAD_TAG, nullptr, 0);
 
+    // HighAsCG WO-993: a DXV payload frame (same GRAY8 word rows) becomes one dxv plane. Its size is fixed per stream
+    // and format, so the plane is just the rows in use.
+    const bool dxv_payload =
+        video && video->format == AV_PIX_FMT_GRAY8 && av_dict_get(video->metadata, DXV_PAYLOAD_TAG, nullptr, 0);
+
     auto pix_desc =
         notchlc_payload ? core::pixel_format_desc(core::pixel_format::notchlc)
+        : dxv_payload   ? core::pixel_format_desc(core::pixel_format::dxv)
         : video         ? pixel_format_desc(
                       static_cast<AVPixelFormat>(video->format), video->width, video->height, data_map, color_space)
                         : core::pixel_format_desc(core::pixel_format::invalid);
@@ -77,6 +84,11 @@ core::mutable_frame make_frame(void*                            tag,
         int64_t           rows      = row_align;
         while (rows < need)
             rows = (rows * 5 / 4 + row_align - 1) / row_align * row_align;
+        pix_desc.planes.push_back(core::pixel_format_desc::plane(
+            video->width / 4, static_cast<int>(std::clamp<int64_t>(rows, 1, video->height)), 4));
+    } else if (dxv_payload) {
+        const int64_t used = core::dxv::read_word(video->data[0], core::dxv::h_used);
+        const int64_t rows = (used + 16 + video->linesize[0] - 1) / video->linesize[0]; // +16: one word of read-ahead
         pix_desc.planes.push_back(core::pixel_format_desc::plane(
             video->width / 4, static_cast<int>(std::clamp<int64_t>(rows, 1, video->height)), 4));
     }
@@ -374,6 +386,7 @@ std::shared_ptr<AVFrame> make_av_video_frame(const core::const_frame& frame, con
             // TODO
             break;
         case core::pixel_format::notchlc: // HighAsCG WO-820: producer-side only, never a channel frame
+        case core::pixel_format::dxv:     // HighAsCG WO-993: likewise
         case core::pixel_format::count:
         case core::pixel_format::invalid:
             break;

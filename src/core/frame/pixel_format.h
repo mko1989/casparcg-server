@@ -43,6 +43,7 @@ enum class pixel_format
     gbrp,  // planar
     gbrap, // planar
     notchlc, // HighAsCG WO-820: NotchLC payload plane (core/frame/notchlc.h), decoded on the GPU by the mixer
+    dxv,     // HighAsCG WO-993: DXV payload plane (core/frame/dxv.h), BC blocks decoded on the GPU by the mixer
     count,
     invalid,
 };

@@ -6,6 +6,7 @@ set(SOURCES
 	ogl/image/image_mixer.cpp
 	ogl/image/image_shader.cpp
 	ogl/image/notchlc_kernel.cpp
+	ogl/image/dxv_kernel.cpp
 
 	ogl/util/buffer.cpp
 	ogl/util/context.cpp
@@ -22,6 +23,7 @@ set(HEADERS
 	ogl/image/image_mixer.h
 	ogl/image/image_shader.h
 	ogl/image/notchlc_kernel.h
+	ogl/image/dxv_kernel.h
 
 	ogl/util/buffer.h
 	ogl/util/context.h
