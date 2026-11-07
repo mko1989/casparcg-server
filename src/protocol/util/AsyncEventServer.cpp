@@ -344,7 +344,7 @@ struct AsyncEventServer::implementation : public spl::enable_shared_from_this<im
 
                 // The peer may already be gone (connect + RST, e.g. a port scan): there is nobody to serve and the
                 // lifecycle factories (OSC subscription by peer address) cannot parse "no-address", so drop it.
-                socket->remote_endpoint(ec);
+                const auto peer = socket->remote_endpoint(ec);
                 if (ec) {
                     CASPAR_LOG(debug) << print() << L" Peer left before the connection was set up: " << ec.message();
                     socket->close(ec);
@@ -361,7 +361,8 @@ struct AsyncEventServer::implementation : public spl::enable_shared_from_this<im
                 connection_set_->insert(conn);
 
                 for (auto& lifecycle_factory : lifecycle_factories_) {
-                    auto lifecycle_bound = lifecycle_factory(u8(conn->ipv4_address()));
+                    // The address read once above: the socket may be closed by now if the peer reset meanwhile.
+                    auto lifecycle_bound = lifecycle_factory(peer.address().to_string());
                     conn->add_lifecycle_bound_object(lifecycle_bound.first, lifecycle_bound.second);
                 }
             } catch (...) {
