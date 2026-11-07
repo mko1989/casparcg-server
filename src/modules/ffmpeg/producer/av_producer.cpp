@@ -4,6 +4,7 @@
 
 #include "../util/av_assert.h"
 #include "../util/av_util.h"
+#include "../util/notchlc_unpack.h"
 
 #include <boost/exception/exception.hpp>
 #include <boost/format.hpp>
@@ -24,6 +25,7 @@
 
 #include <core/frame/draw_frame.h>
 #include <core/frame/frame_factory.h>
+#include <core/frame/notchlc.h>
 #include <core/monitor/monitor.h>
 
 #ifdef _MSC_VER
@@ -37,6 +39,8 @@ extern "C" {
 #include <libavfilter/buffersrc.h>
 #include <libavformat/avformat.h>
 #include <libavutil/avutil.h>
+#include <libavutil/buffer.h>
+#include <libavutil/dict.h>
 #include <libavutil/channel_layout.h>
 #include <libavutil/error.h>
 #include <libavutil/opt.h>
@@ -144,12 +148,58 @@ class Decoder
 
     boost::thread thread;
 
+    // HighAsCG WO-820: NotchLC GPU path. The decoder only undoes LZ4/LZF (notchlc_unpack) and hands the filter graph a
+    // GRAY8 "payload" frame (rows of 32-bit words, tagged NOTCHLC_PAYLOAD_TAG); the OpenGL mixer decodes it.
+    bool                          notchlc_gpu_ = false;
+    int                           nlc_width_   = 0;
+    int                           nlc_height_  = 0;
+    size_t                        nlc_bytes_   = 0;
+    std::shared_ptr<AVBufferPool> nlc_pool_;
+    std::shared_ptr<AVPacket>     nlc_pending_;
+    bool                          nlc_eof_    = false;
+    bool                          nlc_warned_ = false;
+
+    int notchlc_receive(AVFrame* f)
+    {
+        if (!nlc_pending_) {
+            return nlc_eof_ ? AVERROR_EOF : AVERROR(EAGAIN);
+        }
+        auto pkt = std::move(nlc_pending_);
+        nlc_pending_.reset();
+
+        f->buf[0] = av_buffer_pool_get(nlc_pool_.get());
+        if (!f->buf[0]) {
+            return AVERROR(ENOMEM);
+        }
+        f->data[0]     = f->buf[0]->data;
+        f->linesize[0] = core::notchlc::row_words * 4;
+        f->width       = ctx->width;
+        f->height      = ctx->height;
+        f->format      = AV_PIX_FMT_GRAY8;
+
+        const char* error = nullptr;
+        if (!notchlc::unpack(pkt->data, pkt->size, nlc_width_, nlc_height_, f->data[0], nlc_bytes_, &error) &&
+            !nlc_warned_) {
+            nlc_warned_ = true;
+            CASPAR_LOG(warning) << L"[ffmpeg] NotchLC GPU path: undecodable frame (" << error
+                                << L"), drawn transparent. Further errors are not logged.";
+        }
+        av_dict_set(&f->metadata, NOTCHLC_PAYLOAD_TAG, "1", 0);
+        f->best_effort_timestamp = pkt->pts != AV_NOPTS_VALUE ? pkt->pts : pkt->dts;
+        f->pts                   = f->best_effort_timestamp;
+        f->duration              = pkt->duration;
+        f->sample_aspect_ratio   = ctx->sample_aspect_ratio;
+        return 0;
+    }
+
   public:
     std::shared_ptr<AVCodecContext> ctx;
 
     Decoder() = default;
 
-    explicit Decoder(AVStream* stream)
+    bool notchlc_gpu() const { return notchlc_gpu_; }
+
+    explicit Decoder(AVStream* stream, bool allow_notchlc_gpu = false)
         : st(stream)
     {
         const auto codec = get_decoder(stream->codecpar->codec_id);
@@ -178,6 +228,25 @@ class Decoder
 
         ctx->pkt_timebase = stream->time_base;
 
+        // HighAsCG WO-820: NotchLC is decoded on the GPU unless <ffmpeg><producer><notchlc-gpu>false, a user video
+        // filter is set (allow_notchlc_gpu), or the size is not a multiple of 16 (the CPU path stays for those).
+        if (allow_notchlc_gpu && ctx->codec_id == AV_CODEC_ID_NOTCHLC && ctx->width > 0 && ctx->height > 0 &&
+            ctx->width % 16 == 0 && ctx->height % 16 == 0 &&
+            env::properties().get(L"configuration.ffmpeg.producer.notchlc-gpu", true)) {
+            notchlc_gpu_ = true;
+            nlc_width_   = ctx->width;
+            nlc_height_  = ctx->height;
+            ctx->width   = core::notchlc::row_words * 4;
+            ctx->height  = core::notchlc::plane_rows(nlc_width_, nlc_height_);
+            ctx->pix_fmt = AV_PIX_FMT_GRAY8;
+            nlc_bytes_   = static_cast<size_t>(ctx->width) * ctx->height;
+            nlc_pool_    = std::shared_ptr<AVBufferPool>(
+                av_buffer_pool_init(nlc_bytes_ + AV_INPUT_BUFFER_PADDING_SIZE, nullptr),
+                [](AVBufferPool* p) { av_buffer_pool_uninit(&p); });
+            CASPAR_LOG(debug) << L"[ffmpeg] NotchLC " << nlc_width_ << L"x" << nlc_height_
+                              << L": GPU decode (WO-820), payload plane " << ctx->width << L"x" << ctx->height;
+        }
+
         if (ctx->codec_type == AVMEDIA_TYPE_VIDEO) {
             ctx->framerate           = av_guess_frame_rate(nullptr, stream, nullptr);
             ctx->sample_aspect_ratio = av_guess_sample_aspect_ratio(nullptr, stream, nullptr);
@@ -192,13 +261,16 @@ class Decoder
 #endif
         }
 
-        FF(avcodec_open2(ctx.get(), codec, nullptr));
+        if (!notchlc_gpu_) {
+            FF(avcodec_open2(ctx.get(), codec, nullptr));
+        }
 
         thread = boost::thread([=]() {
             try {
                 while (!thread.interruption_requested()) {
                     auto av_frame = alloc_frame();
-                    auto ret      = avcodec_receive_frame(ctx.get(), av_frame.get());
+                    auto ret      = notchlc_gpu_ ? notchlc_receive(av_frame.get())
+                                             : avcodec_receive_frame(ctx.get(), av_frame.get());
 
                     if (ret == AVERROR(EAGAIN)) {
                         std::shared_ptr<AVPacket> packet;
@@ -208,9 +280,16 @@ class Decoder
                             packet = std::move(input.front());
                             input.pop();
                         }
-                        FF(avcodec_send_packet(ctx.get(), packet.get()));
+                        if (notchlc_gpu_) {
+                            nlc_eof_     = !packet;
+                            nlc_pending_ = std::move(packet);
+                        } else {
+                            FF(avcodec_send_packet(ctx.get(), packet.get()));
+                        }
                     } else if (ret == AVERROR_EOF) {
-                        avcodec_flush_buffers(ctx.get());
+                        if (!notchlc_gpu_) {
+                            avcodec_flush_buffers(ctx.get());
+                        }
                         av_frame->pts = next_pts;
                         next_pts      = AV_NOPTS_VALUE;
                         eof           = true;
@@ -388,6 +467,8 @@ struct Filter
            AVMediaType                    media_type,
            const core::video_format_desc& format_desc)
     {
+        const bool user_filter = !filter_spec.empty(); // HighAsCG WO-820: no NotchLC GPU path under a user filter
+        bool       notchlc_gpu = false;
         if (media_type == AVMEDIA_TYPE_VIDEO) {
             if (filter_spec.empty()) {
                 filter_spec = "null";
@@ -551,10 +632,18 @@ struct Filter
 
                 auto it = streams.find(index);
                 if (it == streams.end()) {
-                    it = streams.emplace(index, input->streams[index]).first;
+                    it = streams
+                             .emplace(std::piecewise_construct,
+                                      std::forward_as_tuple(index),
+                                      std::forward_as_tuple(input->streams[index],
+                                                            media_type == AVMEDIA_TYPE_VIDEO && !user_filter))
+                             .first;
                 }
 
                 auto st = it->second.ctx;
+                if (st->codec_type == AVMEDIA_TYPE_VIDEO && it->second.notchlc_gpu()) {
+                    notchlc_gpu = true;
+                }
 
                 if (st->codec_type == AVMEDIA_TYPE_VIDEO) {
                     auto args = (boost::format("video_size=%dx%d:pix_fmt=%d:time_base=%d/%d") % st->width % st->height %
@@ -638,12 +727,17 @@ struct Filter
                                               AV_PIX_FMT_GBRAP,
                                               AV_PIX_FMT_GBRAP16,
                                               AV_PIX_FMT_NONE};
+            // HighAsCG WO-820: the NotchLC payload must reach the sink untouched (no format conversion).
+            const AVPixelFormat payload_fmts[] = {AV_PIX_FMT_GRAY8, AV_PIX_FMT_NONE};
+            const auto          sink_fmts      = notchlc_gpu ? payload_fmts : pix_fmts;
+            const auto          sink_fmt_count = notchlc_gpu ? 1 : FF_ARRAY_ELEMS(pix_fmts) - 1;
 #if LIBAVUTIL_VERSION_MAJOR >= 60 // FFmpeg 8
             FF(av_opt_set_array(sink, "pixel_formats", AV_OPT_SEARCH_CHILDREN | AV_OPT_ARRAY_REPLACE,
-                0, FF_ARRAY_ELEMS(pix_fmts) - 1, AV_OPT_TYPE_PIXEL_FMT, pix_fmts)
+                0, sink_fmt_count, AV_OPT_TYPE_PIXEL_FMT, sink_fmts)
             );
 #else
-            FF(av_opt_set_int_list(sink, "pix_fmts", pix_fmts, -1, AV_OPT_SEARCH_CHILDREN));
+            FF(av_opt_set_int_list(sink, "pix_fmts", sink_fmts, -1, AV_OPT_SEARCH_CHILDREN));
+            (void)sink_fmt_count;
 #endif
 #ifdef _MSC_VER
 #pragma warning(pop)

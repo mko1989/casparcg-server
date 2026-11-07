@@ -15,6 +15,8 @@ set(SOURCES
 	util/av_util.h
 	util/audio_resampler.cpp
 	util/audio_resampler.h
+	util/notchlc_unpack.cpp
+	util/notchlc_unpack.h
 	util/av_assert.h
 
 	ffmpeg.cpp

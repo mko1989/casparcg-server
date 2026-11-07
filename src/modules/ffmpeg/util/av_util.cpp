@@ -2,6 +2,7 @@
 #include "av_assert.h"
 
 #include <common/bit_depth.h>
+#include <core/frame/notchlc.h>
 
 #if defined(_MSC_VER)
 #pragma warning(push)
@@ -11,6 +12,7 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavfilter/avfilter.h>
 #include <libavutil/channel_layout.h>
+#include <libavutil/dict.h>
 #include <libavutil/frame.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/pixfmt.h>
@@ -19,6 +21,7 @@ extern "C" {
 #pragma warning(pop)
 #endif
 
+#include <algorithm>
 #include <array>
 #include <tbb/parallel_for.h>
 #include <tbb/parallel_invoke.h>
@@ -53,10 +56,31 @@ core::mutable_frame make_frame(void*                            tag,
 {
     std::vector<int> data_map; // TODO(perf) when using data_map, avoid uploading duplicate planes
 
+    // HighAsCG WO-820: a NotchLC payload frame (GRAY8 rows of 32-bit words, tagged by the decoder) becomes one
+    // notchlc plane of BGRA texels (the mixer decodes it on the GPU). The plane only holds the rows in use (see the size
+    // classes below), so copy and upload follow the frame's real payload size and not the decoder's worst-case
+    // capacity.
+    const bool notchlc_payload =
+        video && video->format == AV_PIX_FMT_GRAY8 && av_dict_get(video->metadata, NOTCHLC_PAYLOAD_TAG, nullptr, 0);
+
     auto pix_desc =
-        video ? pixel_format_desc(
-                    static_cast<AVPixelFormat>(video->format), video->width, video->height, data_map, color_space)
-              : core::pixel_format_desc(core::pixel_format::invalid);
+        notchlc_payload ? core::pixel_format_desc(core::pixel_format::notchlc)
+        : video         ? pixel_format_desc(
+                      static_cast<AVPixelFormat>(video->format), video->width, video->height, data_map, color_space)
+                        : core::pixel_format_desc(core::pixel_format::invalid);
+    if (notchlc_payload) {
+        // The plane only holds the rows in use, rounded up to a size class (64 rows, then +25% steps). The GL device
+        // pools textures and host buffers per exact size and never shrinks them, so a plain 64-row rounding left one
+        // pool per payload size (WO-820 frontex stress: 51 heights, 6.5 GB of pooled textures after 24 takes).
+        constexpr int64_t row_align = 64;
+        const int64_t     used      = core::notchlc::read_word(video->data[0], core::notchlc::h_used);
+        const int64_t     need      = (used + 16 + video->linesize[0] - 1) / video->linesize[0]; // +16: bit reader reads one word ahead
+        int64_t           rows      = row_align;
+        while (rows < need)
+            rows = (rows * 5 / 4 + row_align - 1) / row_align * row_align;
+        pix_desc.planes.push_back(core::pixel_format_desc::plane(
+            video->width / 4, static_cast<int>(std::clamp<int64_t>(rows, 1, video->height)), 4));
+    }
     pix_desc.is_straight_alpha = is_straight_alpha;
 
     auto frame = frame_factory.create_frame(tag, pix_desc);
@@ -337,6 +361,7 @@ std::shared_ptr<AVFrame> make_av_video_frame(const core::const_frame& frame, con
         case core::pixel_format::gbrap:
             // TODO
             break;
+        case core::pixel_format::notchlc: // HighAsCG WO-820: producer-side only, never a channel frame
         case core::pixel_format::count:
         case core::pixel_format::invalid:
             break;

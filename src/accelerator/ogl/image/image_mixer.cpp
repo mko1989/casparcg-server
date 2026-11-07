@@ -21,6 +21,7 @@
 #include "image_mixer.h"
 
 #include "image_kernel.h"
+#include "notchlc_kernel.h"
 
 #include "../util/buffer.h"
 #include "../util/device.h"
@@ -310,7 +311,17 @@ struct image_mixer::impl
 
         auto textures_ptr = std::any_cast<std::shared_ptr<std::vector<future_texture>>>(frame.opaque());
 
-        if (textures_ptr) {
+        // HighAsCG WO-820: a NotchLC payload frame is drawn from its GPU-decoded RGBA texture.
+        if (item.pix_desc.format == core::pixel_format::notchlc) {
+            const auto payload_desc = item.pix_desc;
+            if (!notchlc_decoded_desc(frame.image_data(0), item.pix_desc))
+                return;
+            if (textures_ptr) {
+                item.textures = *textures_ptr;
+            } else {
+                item.textures.emplace_back(notchlc_decode_async(ogl_, frame.image_data(0), payload_desc));
+            }
+        } else if (textures_ptr) {
             item.textures = *textures_ptr;
         } else {
             for (int n = 0; n < static_cast<int>(item.pix_desc.planes.size()); ++n) {
@@ -362,6 +373,10 @@ struct image_mixer::impl
                                            return std::any{};
                                        }
                                        std::vector<future_texture> textures;
+                                       if (desc.format == core::pixel_format::notchlc) { // HighAsCG WO-820
+                                           textures.emplace_back(notchlc_decode_async(self->ogl_, image_data.at(0), desc));
+                                           return std::make_shared<decltype(textures)>(std::move(textures));
+                                       }
                                        for (int n = 0; n < static_cast<int>(desc.planes.size()); ++n) {
                                            textures.emplace_back(self->ogl_->copy_async(image_data[n],
                                                                                         desc.planes[n].width,

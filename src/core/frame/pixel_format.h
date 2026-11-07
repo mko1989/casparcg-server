@@ -42,6 +42,7 @@ enum class pixel_format
     uyvy,
     gbrp,  // planar
     gbrap, // planar
+    notchlc, // HighAsCG WO-820: NotchLC payload plane (core/frame/notchlc.h), decoded on the GPU by the mixer
     count,
     invalid,
 };

@@ -32,6 +32,9 @@ core::pixel_format_desc pixel_format_desc(AVPixelFormat     pix_fmt,
                                           int               height,
                                           std::vector<int>& data_map,
                                           core::color_space color_space = core::color_space::bt709);
+// HighAsCG WO-820: AVFrame metadata key that marks a NotchLC payload frame (see notchlc_unpack.h).
+constexpr const char* NOTCHLC_PAYLOAD_TAG = "highascg_notchlc_payload";
+
 core::mutable_frame     make_frame(void*                    tag,
                                    core::frame_factory&     frame_factory,
                                    std::shared_ptr<AVFrame> video,
