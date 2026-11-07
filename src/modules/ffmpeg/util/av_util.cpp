@@ -24,7 +24,6 @@ extern "C" {
 #include <algorithm>
 #include <array>
 #include <tbb/parallel_for.h>
-#include <tbb/parallel_invoke.h>
 
 #include <tuple>
 
@@ -88,8 +87,11 @@ core::mutable_frame make_frame(void*                            tag,
         frame.geometry() = core::frame_geometry::get_default(scale_mode);
     }
 
-    tbb::parallel_invoke(
-        [&]() {
+    // HighAsCG: video then audio on this thread. parallel_invoke handed one of the two to the TBB pool for every
+    // frame of every FFmpeg, DeckLink, NDI and image layer, and each hand-off woke and spun the whole 15-worker pool
+    // (≈15 % of a core with nothing but a 50p DeckLink input and one clip, WO-992). The audio copy is a few µs.
+    {
+        {
             if (video) {
                 for (int n = 0; n < static_cast<int>(pix_desc.planes.size()); ++n) {
                     auto frame_plan_index = data_map.empty() ? n : data_map.at(n);
@@ -110,8 +112,8 @@ core::mutable_frame make_frame(void*                            tag,
                     }
                 }
             }
-        },
-        [&]() {
+        }
+        {
             if (audio) {
                 const int channel_count = 16;
                 frame.audio_data()      = std::vector<int32_t>(audio->nb_samples * channel_count, 0);
@@ -138,7 +140,8 @@ core::mutable_frame make_frame(void*                            tag,
                     }
                 }
             }
-        });
+        }
+    }
 
     return frame;
 }

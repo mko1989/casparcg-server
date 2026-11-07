@@ -681,17 +681,17 @@ struct ffmpeg_consumer : public core::frame_consumer
                                       static_cast<double>(frame_buffer_.size() + 0.001) / frame_buffer_.capacity());
 
                     caspar::timer frame_timer;
-                    tbb::parallel_invoke(
-                        [&] {
-                            if (video_stream) {
-                                video_stream->send(data, format_desc, packet_cb);
-                            }
-                        },
-                        [&] {
-                            if (audio_stream) {
-                                audio_stream->send(data, format_desc, packet_cb);
-                            }
-                        });
+                    // HighAsCG: only hand work to the TBB pool when there are two streams to overlap. A video-only
+                    // consumer (HighAsCG's per-channel preview UDP streams) used to wake and spin the whole 15-worker
+                    // pool on every frame for nothing (WO-992).
+                    if (video_stream && audio_stream) {
+                        tbb::parallel_invoke([&] { video_stream->send(data, format_desc, packet_cb); },
+                                             [&] { audio_stream->send(data, format_desc, packet_cb); });
+                    } else if (video_stream) {
+                        video_stream->send(data, format_desc, packet_cb);
+                    } else if (audio_stream) {
+                        audio_stream->send(data, format_desc, packet_cb);
+                    }
                     graph_->set_value("frame-time", frame_timer.elapsed() * format_desc.fps * 0.5);
 
                     if (!std::get<0>(data)) {
