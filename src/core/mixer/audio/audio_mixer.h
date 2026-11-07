@@ -49,6 +49,9 @@ class audio_mixer final : public frame_visitor
     float                get_master_volume();
     core::monitor::state state() const;
 
+    // HighAsCG WO-800: audio visited until the next call belongs to stage layer `layer` (-1 = none).
+    void begin_layer(int layer);
+
     void push(const struct frame_transform& transform) override;
     void visit(const class const_frame& frame) override;
     void pop() override;

@@ -43,7 +43,11 @@ class mixer final
                    spl::shared_ptr<caspar::diagnostics::graph> graph,
                    spl::shared_ptr<image_mixer>                image_mixer);
 
-    const_frame operator()(std::vector<draw_frame> frames, const video_format_desc& format_desc, int nb_samples);
+    // HighAsCG WO-800: `layers` = layer index per entry of `frames` (per-layer audio meters); may be empty.
+    const_frame operator()(std::vector<draw_frame>  frames,
+                           const video_format_desc& format_desc,
+                           int                      nb_samples,
+                           const std::vector<int>&  layers = {});
 
     void  set_master_volume(float volume);
     float get_master_volume();

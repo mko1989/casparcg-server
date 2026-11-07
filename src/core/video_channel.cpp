@@ -160,11 +160,11 @@ struct video_channel::impl final
                     // Mix
                     caspar::timer mix_timer;
                     auto          mixed_frame =
-                        has_consumers ? mixer_(stage_frames.frames, stage_frames.format_desc, stage_frames.nb_samples)
+                        has_consumers ? mixer_(stage_frames.frames, stage_frames.format_desc, stage_frames.nb_samples, stage_frames.layers)
                                                : const_frame{};
                     auto mixed_frame2 =
                         has_consumers && stage_frames.format_desc.field_count == 2
-                            ? mixer_(stage_frames.frames2, stage_frames.format_desc, stage_frames.nb_samples)
+                            ? mixer_(stage_frames.frames2, stage_frames.format_desc, stage_frames.nb_samples, stage_frames.layers)
                             : const_frame{};
                     graph_->set_value("mix-time", mix_timer.elapsed() * format_desc.hz * 0.5);
 

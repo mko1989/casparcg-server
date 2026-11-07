@@ -46,6 +46,7 @@ struct audio_item
     const void*          tag = nullptr;
     audio_transform      transform;
     array<const int32_t> samples;
+    int                  layer = -1; // HighAsCG WO-800: stage layer index, -1 = not metered per layer
 };
 
 using audio_buffer_ps = std::vector<double>;
@@ -65,6 +66,7 @@ struct audio_mixer::impl
     bool                                        has_variable_cadence_{false};
     std::vector<int32_t>                        silence_buffer_;
     int                                         channels_{0};
+    int                                         current_layer_{-1}; // HighAsCG WO-800
 
     impl(spl::shared_ptr<diagnostics::graph> graph)
         : graph_(std::move(graph))
@@ -88,8 +90,11 @@ struct audio_mixer::impl
         if (transform_stack_.top().volume < 0.002 || !frame.audio_data())
             return;
 
-        items_.push_back(std::move(audio_item{frame.stream_tag(), transform_stack_.top(), frame.audio_data()}));
+        items_.push_back(
+            std::move(audio_item{frame.stream_tag(), transform_stack_.top(), frame.audio_data(), current_layer_}));
     }
+
+    void begin_layer(int layer) { current_layer_ = layer; }
 
     void pop() { transform_stack_.pop(); }
 
@@ -136,6 +141,10 @@ struct audio_mixer::impl
         std::map<const void*, std::vector<int32_t>> next_audio_streams;
         std::map<const void*, double> next_volumes;
 
+        // HighAsCG WO-800: per-layer sum of the same scaled samples that go into `mixed`. Only layers that
+        // queued audio this frame get a buffer (and later a state key).
+        std::map<int, std::vector<double>> layer_mixed;
+
         for (auto& item : items) {
             auto ptr       = item.samples.data();
             auto item_size = item.samples.size();
@@ -168,6 +177,16 @@ struct audio_mixer::impl
             // Store current volume for next frame
             next_volumes[item.tag] = item.transform.volume;
 
+            // HighAsCG WO-800: a frame with an empty audio buffer (a stopped/ended producer still visits) adds nothing
+            // to its layer's meter, so the layer drops out of the state instead of holding a level.
+            double* layer_dst = nullptr;
+            if (item.layer >= 0 && (item_size > 0 || last_size > 0)) {
+                auto& buf = layer_mixed[item.layer];
+                if (buf.empty())
+                    buf.assign(mixed.size(), 0.0);
+                layer_dst = buf.data();
+            }
+
             // Sample collection and volume application loop
             for (auto n = 0; n < dst_size; ++n) {
                 double sample_value = 0.0;
@@ -176,6 +195,9 @@ struct audio_mixer::impl
                     sample_value = static_cast<double>(last_ptr[n]);
                 } else if (n < last_size + item_size) {
                     sample_value = static_cast<double>(ptr[n - last_size]);
+                } else if (item_size == 0) {
+                    // HighAsCG WO-800: nothing to hold — the hold below would read ptr[] out of bounds
+                    sample_value = 0.0;
                 } else {
                     // If we run out of samples, hold the last sample value per channel
                     int channel_pos = n % channels_;
@@ -202,7 +224,10 @@ struct audio_mixer::impl
                     applied_volume = previous_volume + (item.transform.volume - previous_volume) * position;
                 }
                 
-                mixed[n] += sample_value * applied_volume;
+                const double scaled = sample_value * applied_volume;
+                mixed[n] += scaled;
+                if (layer_dst)
+                    layer_dst[n] += scaled;
             }
 
             if (has_variable_cadence_ && item.tag) {
@@ -259,7 +284,24 @@ struct audio_mixer::impl
             graph_->set_tag(diagnostics::tag_severity::WARNING, "audio-clipping");
         }
 
-        state_["volume"] = std::move(max);
+        // HighAsCG WO-800: rebuild the state each mix so a layer that stops contributing audio drops out.
+        // Per layer: same peak as the channel (x master volume, clamped to int32, per audio channel max |sample|).
+        // OSC: /channel/<ch>/mixer/audio/layer/<L>/volume, int32 x channels; the channel `volume` key is unchanged.
+        monitor::state state;
+        state["volume"] = max;
+        for (const auto& lm : layer_mixed) {
+            auto layer_max = std::vector<int32_t>(channels_, 0);
+            const auto& buf = lm.second;
+            for (size_t n = 0; n < buf.size(); n += channels_) {
+                for (int ch = 0; ch < channels_; ++ch) {
+                    const double v = std::min(std::abs(buf[n + ch] * master_volume),
+                                              static_cast<double>(std::numeric_limits<int32_t>::max()));
+                    layer_max[ch]  = std::max(layer_max[ch], static_cast<int32_t>(v));
+                }
+            }
+            state["layer"][lm.first]["volume"] = layer_max;
+        }
+        state_ = state;
 
         graph_->set_value("volume",
                           static_cast<double>(*boost::max_element(max)) / std::numeric_limits<int32_t>::max());
@@ -282,5 +324,6 @@ array<const int32_t> audio_mixer::operator()(const video_format_desc& format_des
     return impl_->mix(format_desc, nb_samples);
 }
 core::monitor::state audio_mixer::state() const { return impl_->state_; }
+void                 audio_mixer::begin_layer(int layer) { impl_->begin_layer(layer); }
 
 }} // namespace caspar::core
