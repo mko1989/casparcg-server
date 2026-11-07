@@ -132,11 +132,28 @@ class connection : public spl::enable_shared_from_this<connection>
 
     std::wstring print() const { return L"async_event_server[:" + listen_port_ + L"]"; }
 
-    std::wstring address() const { return u16(socket_->local_endpoint().address().to_string()); }
+    // Non-throwing endpoint queries: a peer that connects and resets at once (a port scan) has no remote endpoint
+    // by the time we look; the throwing overloads used to escape handle_accept and kill the accept loop (HighAsCG
+    // WO-990).
+    std::wstring address() const
+    {
+        boost::system::error_code ec;
+        auto                      ep = socket_->local_endpoint(ec);
+        return ec ? L"no-address" : u16(ep.address().to_string());
+    }
 
     std::wstring ipv4_address() const
     {
-        return socket_->is_open() ? u16(socket_->remote_endpoint().address().to_string()) : L"no-address";
+        boost::system::error_code ec;
+        auto                      ep = socket_->remote_endpoint(ec);
+        return ec ? L"no-address" : u16(ep.address().to_string());
+    }
+
+    static std::wstring local_port(const tcp::socket& socket)
+    {
+        boost::system::error_code ec;
+        auto                      ep = socket.local_endpoint(ec);
+        return ec ? L"no-port" : std::to_wstring(ep.port());
     }
 
     void send(std::string&& data)
@@ -203,7 +220,7 @@ class connection : public spl::enable_shared_from_this<connection>
                const spl::shared_ptr<connection_set>&          connection_set)
         : socket_(socket)
         , io_context_(io_context)
-        , listen_port_(socket_->is_open() ? std::to_wstring(socket_->local_endpoint().port()) : L"no-port")
+        , listen_port_(local_port(*socket_))
         , connection_set_(connection_set)
         , protocol_factory_(protocol_factory)
         , is_writing_(false)
@@ -321,19 +338,39 @@ struct AsyncEventServer::implementation : public spl::enable_shared_from_this<im
             return;
 
         if (!error) {
-            boost::system::error_code ec;
-            socket->set_option(boost::asio::socket_base::keep_alive(true), ec);
+            // Whatever one connection does, the accept loop below must be re-armed (HighAsCG WO-990).
+            try {
+                boost::system::error_code ec;
 
-            if (ec)
-                CASPAR_LOG(warning) << print() << L" Failed to enable TCP keep-alive on socket";
+                // The peer may already be gone (connect + RST, e.g. a port scan): there is nobody to serve and the
+                // lifecycle factories (OSC subscription by peer address) cannot parse "no-address", so drop it.
+                socket->remote_endpoint(ec);
+                if (ec) {
+                    CASPAR_LOG(debug) << print() << L" Peer left before the connection was set up: " << ec.message();
+                    socket->close(ec);
+                    start_accept();
+                    return;
+                }
 
-            auto conn = connection::create(io_context_, socket, protocol_factory_, connection_set_);
-            connection_set_->insert(conn);
+                socket->set_option(boost::asio::socket_base::keep_alive(true), ec);
 
-            for (auto& lifecycle_factory : lifecycle_factories_) {
-                auto lifecycle_bound = lifecycle_factory(u8(conn->ipv4_address()));
-                conn->add_lifecycle_bound_object(lifecycle_bound.first, lifecycle_bound.second);
+                if (ec)
+                    CASPAR_LOG(warning) << print() << L" Failed to enable TCP keep-alive on socket";
+
+                auto conn = connection::create(io_context_, socket, protocol_factory_, connection_set_);
+                connection_set_->insert(conn);
+
+                for (auto& lifecycle_factory : lifecycle_factories_) {
+                    auto lifecycle_bound = lifecycle_factory(u8(conn->ipv4_address()));
+                    conn->add_lifecycle_bound_object(lifecycle_bound.first, lifecycle_bound.second);
+                }
+            } catch (...) {
+                CASPAR_LOG_CURRENT_EXCEPTION();
+                boost::system::error_code ec;
+                socket->close(ec);
             }
+        } else if (error == boost::asio::error::operation_aborted) {
+            return;
         }
         start_accept();
     }
