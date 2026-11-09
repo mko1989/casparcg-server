@@ -121,6 +121,20 @@ struct video_format_desc final
     video_format_desc();
 };
 
+// HighAsCG WO-1020: the one validator for custom modes, shared by <video-modes> at startup and AMCP VIDEO-MODE ADD.
+// Throws user_error on bad dimensions, field count, frame rate or audio cadence (the cadence must sum to 48 kHz).
+// An empty cadence is derived for integer rates, exactly as the startup parser did.
+video_format_desc make_custom_video_format_desc(const std::wstring& id,
+                                                int                 width,
+                                                int                 height,
+                                                int                 field_count,
+                                                int                 time_scale,
+                                                int                 duration,
+                                                const std::wstring& cadence);
+
+// HighAsCG WO-1020: true when two custom descs are the same mode (size, fields, rate, cadence).
+bool same_video_mode(const video_format_desc& a, const video_format_desc& b);
+
 bool operator==(const video_format_desc& rhs, const video_format_desc& lhs);
 bool operator!=(const video_format_desc& rhs, const video_format_desc& lhs);
 
@@ -133,7 +147,8 @@ class video_format_repository
 
     video_format_desc find(const std::wstring& name) const;
     video_format_desc find_format(const video_format& format) const;
-    void              store(const video_format_desc& format);
+    // HighAsCG WO-1020: thread-safe (VIDEO-MODE ADD writes at runtime). Returns false if the id already exists.
+    bool store(const video_format_desc& format);
 
     std::size_t get_max_video_format_size() const;
 

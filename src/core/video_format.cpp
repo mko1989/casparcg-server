@@ -23,10 +23,14 @@
 
 #include "video_format.h"
 
+#include <common/except.h>
 #include <common/log.h>
 
 #include <boost/algorithm/string.hpp>
 #include <boost/range/adaptors.hpp>
+#include <list>
+#include <mutex>
+#include <shared_mutex>
 #include <utility>
 
 namespace caspar { namespace core {
@@ -34,6 +38,8 @@ namespace caspar { namespace core {
 struct video_format_repository::impl
 {
   private:
+    // HighAsCG WO-1020: VIDEO-MODE ADD writes at runtime while producers/AMCP read from other threads.
+    mutable std::shared_mutex                 mutex_;
     std::map<std::wstring, video_format_desc> formats_;
 
   public:
@@ -155,6 +161,8 @@ struct video_format_repository::impl
     {
         const std::wstring lower = boost::to_lower_copy(name);
 
+        std::shared_lock<std::shared_mutex> lock(mutex_);
+
         const auto res = formats_.find(lower);
         if (res != formats_.end())
             return res->second;
@@ -164,6 +172,7 @@ struct video_format_repository::impl
 
     video_format_desc find_format(const video_format& id) const
     {
+        std::shared_lock<std::shared_mutex> lock(mutex_);
         for (auto& f : formats_) {
             if (f.second.format == id)
                 return f.second;
@@ -172,15 +181,18 @@ struct video_format_repository::impl
         return invalid();
     }
 
-    void store(const video_format_desc& format)
+    bool store(const video_format_desc& format)
     {
         const std::wstring lower = boost::to_lower_copy(format.name);
-        formats_.insert({lower, format});
+
+        std::unique_lock<std::shared_mutex> lock(mutex_);
+        return formats_.insert({lower, format}).second;
     }
 
     std::size_t get_max_video_format_size() const
     {
-        size_t max = 0;
+        std::shared_lock<std::shared_mutex> lock(mutex_);
+        size_t                              max = 0;
         for (auto& f : formats_) {
             if (f.second.size > max)
                 max = f.second.size;
@@ -204,7 +216,7 @@ video_format_desc video_format_repository::find_format(const video_format& forma
 {
     return impl_->find_format(format);
 }
-void video_format_repository::store(const video_format_desc& format) { impl_->store(format); }
+bool video_format_repository::store(const video_format_desc& format) { return impl_->store(format); }
 
 std::size_t video_format_repository::get_max_video_format_size() const { return impl_->get_max_video_format_size(); }
 
@@ -240,6 +252,74 @@ video_format_desc::video_format_desc()
     : format(video_format::invalid)
 {
     *this = video_format_repository::invalid();
+}
+
+video_format_desc make_custom_video_format_desc(const std::wstring& id,
+                                                int                 width,
+                                                int                 height,
+                                                int                 field_count,
+                                                int                 time_scale,
+                                                int                 duration,
+                                                const std::wstring& cadence_str)
+{
+    if (id.empty())
+        CASPAR_THROW_EXCEPTION(user_error() << msg_info(L"Invalid video-mode id: " + id));
+
+    if (width <= 0 || height <= 0)
+        CASPAR_THROW_EXCEPTION(user_error() << msg_info(L"Invalid dimensions: " + std::to_wstring(width) + L"x" +
+                                                        std::to_wstring(height)));
+
+    if (field_count != 1 && field_count != 2)
+        CASPAR_THROW_EXCEPTION(user_error() << msg_info(L"Invalid field-count: " + std::to_wstring(field_count)));
+
+    if (time_scale <= 0 || duration <= 0)
+        CASPAR_THROW_EXCEPTION(user_error() << msg_info(L"Invalid framerate: " + std::to_wstring(time_scale) + L"/" +
+                                                        std::to_wstring(duration)));
+
+    std::vector<int> cadence;
+    long long        cadence_sum = 0;
+
+    std::list<std::wstring> cadence_parts;
+    boost::split(cadence_parts, cadence_str, boost::is_any_of(L", "));
+
+    for (auto& cad : cadence_parts) {
+        if (cad.empty())
+            continue;
+
+        int c = 0;
+        try {
+            c = std::stoi(cad);
+        } catch (...) {
+            CASPAR_THROW_EXCEPTION(user_error() << msg_info(L"Invalid cadence value in video-mode " + id + L": " + cad));
+        }
+        if (c <= 0)
+            CASPAR_THROW_EXCEPTION(user_error() << msg_info(L"Invalid cadence value in video-mode " + id + L": " + cad));
+        cadence.push_back(c);
+        cadence_sum += c;
+    }
+
+    if (cadence.empty()) {
+        // Attempt to calculate in the cadence for integer formats
+        const int c = static_cast<int>(48000 / (static_cast<double>(time_scale) / duration) + 0.5);
+        cadence.push_back(c);
+        cadence_sum += c;
+    }
+
+    if (cadence_sum * time_scale != 48000LL * duration * static_cast<long long>(cadence.size())) {
+        auto samples_per_second = static_cast<double>(cadence_sum * time_scale) / (duration * cadence.size());
+        CASPAR_THROW_EXCEPTION(user_error() << msg_info(L"Incorrect cadence in video-mode " + id + L". Got " +
+                                                        std::to_wstring(samples_per_second) +
+                                                        L" samples per second, expected 48000"));
+    }
+
+    return video_format_desc(
+        video_format::custom, field_count, width, height, width, height, time_scale, duration, id, cadence);
+}
+
+bool same_video_mode(const video_format_desc& a, const video_format_desc& b)
+{
+    return a.format == b.format && a.width == b.width && a.height == b.height && a.field_count == b.field_count &&
+           a.time_scale == b.time_scale && a.duration == b.duration && a.audio_cadence == b.audio_cadence;
 }
 
 bool operator==(const video_format_desc& lhs, const video_format_desc& rhs)

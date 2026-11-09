@@ -47,7 +47,10 @@
 
 #include <GL/glew.h>
 
+#include <algorithm>
 #include <any>
+#include <memory>
+#include <mutex>
 #include <vector>
 
 namespace caspar { namespace accelerator { namespace ogl {
@@ -94,10 +97,24 @@ class image_renderer
     operator()(std::vector<layer> layers, const core::video_format_desc& format_desc)
     {
         if (layers.empty()) { // Bypass GPU with empty frame.
-            static const std::vector<uint8_t, boost::alignment::aligned_allocator<uint8_t, 32>> buffer(max_frame_size_,
-                                                                                                       0);
+            // HighAsCG WO-1020: one shared zero buffer, grown when a bigger mode appears (VIDEO-MODE ADD at runtime).
+            // It used to be a function-local static sized once from the boot max, so a channel on a mode added later
+            // would have read past its end. Each returned array keeps the buffer it points into alive.
+            using zero_buffer_t = std::vector<uint8_t, boost::alignment::aligned_allocator<uint8_t, 32>>;
+            static std::mutex                           zero_mutex;
+            static std::shared_ptr<const zero_buffer_t> zero_buffer;
+
+            std::shared_ptr<const zero_buffer_t> buffer;
+            {
+                const size_t                needed = std::max(max_frame_size_, format_desc.size * 2);
+                std::lock_guard<std::mutex> lock(zero_mutex);
+                if (!zero_buffer || zero_buffer->size() < needed)
+                    zero_buffer = std::make_shared<const zero_buffer_t>(needed, 0);
+                buffer = zero_buffer;
+            }
+            const auto* data = buffer->data();
             return make_ready_future<std::tuple<array<const std::uint8_t>, std::shared_ptr<core::texture>>>(
-                { array<const std::uint8_t>(buffer.data(), format_desc.size, true), nullptr }
+                { array<const std::uint8_t>(data, format_desc.size, std::move(buffer)), nullptr }
             );
         }
 
