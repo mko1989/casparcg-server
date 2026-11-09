@@ -33,6 +33,7 @@
 #include "../util/tokenize.h"
 
 #include <algorithm>
+#include <mutex>
 
 #include <boost/algorithm/string.hpp>
 #include <boost/log/keywords/delimiter.hpp>
@@ -90,21 +91,40 @@ class AMCPClientBatchInfo
 class AMCPProtocolStrategy
 {
   private:
+    // One strategy per AMCP controller (port) and one for the console; every connection on it shares these queues.
+    // HighAsCG WO-1020: index 0 is the general queue, index n the queue for channel n. Queues for channels added at
+    // runtime are created on first use, so connections opened before a CHANNEL ADD can address the new channel.
+    std::mutex                               queues_mutex_;
     std::vector<AMCPCommandQueue::ptr_type>  commandQueues_;
     spl::shared_ptr<amcp_command_repository> repo_;
+    const std::wstring                       name_;
 
   public:
     AMCPProtocolStrategy(const std::wstring& name, const spl::shared_ptr<amcp_command_repository>& repo)
         : repo_(repo)
+        , name_(name)
     {
         commandQueues_.push_back(spl::make_shared<AMCPCommandQueue>(L"General Queue for " + name, repo_->channels()));
 
-        for (auto& ch : *repo_->channels()) {
-            auto queue = spl::make_shared<AMCPCommandQueue>(
-                L"Channel " + std::to_wstring(ch.raw_channel->index()) + L" for " + name, repo_->channels());
-            std::weak_ptr<AMCPCommandQueue> queue_weak = queue;
-            commandQueues_.push_back(queue);
-        }
+        const auto channels = repo_->channels()->snapshot();
+        for (size_t n = 1; n <= channels->size(); ++n)
+            commandQueues_.push_back(make_channel_queue(static_cast<int>(n)));
+    }
+
+    AMCPCommandQueue::ptr_type make_channel_queue(int channel_number) const
+    {
+        return spl::make_shared<AMCPCommandQueue>(L"Channel " + std::to_wstring(channel_number) + L" for " + name_,
+                                                  repo_->channels());
+    }
+
+    // channel_index is 0-based, -1 for the general queue.
+    AMCPCommandQueue::ptr_type queue_for(int channel_index)
+    {
+        const size_t                at = static_cast<size_t>(channel_index + 1);
+        std::lock_guard<std::mutex> lock(queues_mutex_);
+        while (commandQueues_.size() <= at)
+            commandQueues_.push_back(make_channel_queue(static_cast<int>(commandQueues_.size())));
+        return commandQueues_.at(at);
     }
 
     ~AMCPProtocolStrategy() {}
@@ -218,7 +238,7 @@ class AMCPProtocolStrategy
             }
 
             auto wrapped = std::make_shared<AMCPGroupCommand>(command);
-            commandQueues_.at(channel_index + 1)->AddCommand(std::move(wrapped));
+            queue_for(channel_index)->AddCommand(std::move(wrapped));
             return error_state::no_error;
 
         } catch (std::out_of_range&) {
@@ -259,7 +279,7 @@ class AMCPProtocolStrategy
                 return true;
             }
 
-            commandQueues_.at(0)->AddCommand(std::move(batch->finish()));
+            queue_for(-1)->AddCommand(std::move(batch->finish()));
             error = error_state::no_error;
             return true;
         }

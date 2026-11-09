@@ -33,7 +33,7 @@ class AMCPCommandQueue
   public:
     using ptr_type = spl::shared_ptr<AMCPCommandQueue>;
 
-    AMCPCommandQueue(const std::wstring& name, const spl::shared_ptr<std::vector<channel_context>>& channels);
+    AMCPCommandQueue(const std::wstring& name, const spl::shared_ptr<channel_list>& channels);
     ~AMCPCommandQueue();
 
     void AddCommand(std::shared_ptr<AMCPGroupCommand> command);
@@ -41,7 +41,7 @@ class AMCPCommandQueue
 
   private:
     executor                                            executor_;
-    const spl::shared_ptr<std::vector<channel_context>> channels_;
+    const spl::shared_ptr<channel_list> channels_; // HighAsCG WO-1020: snapshot taken per command
 };
 
 }}} // namespace caspar::protocol::amcp

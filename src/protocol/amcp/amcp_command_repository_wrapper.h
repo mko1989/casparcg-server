@@ -23,6 +23,8 @@
 
 #include "amcp_command_context.h"
 
+#include <common/except.h>
+
 namespace caspar { namespace protocol { namespace amcp {
 
 typedef std::function<std::future<std::wstring>(command_context& args)> amcp_command_impl_func_future;
@@ -40,7 +42,7 @@ class command_context_factory
                            const spl::shared_ptr<std::vector<channel_context>>& channels) const
     {
         const channel_context channel =
-            simple_ctx.channel_index >= 0 ? channels->at(simple_ctx.channel_index) : channel_context();
+            simple_ctx.channel_index >= 0 ? checked_channel(simple_ctx, channels) : channel_context();
         auto ctx = command_context(
             static_context_, channels, simple_ctx.client, channel, simple_ctx.channel_index, simple_ctx.layer_id);
         ctx.parameters = std::move(simple_ctx.parameters);
@@ -48,6 +50,23 @@ class command_context_factory
     }
 
   private:
+    // HighAsCG WO-1020: the slot may have been emptied (CHANNEL REMOVE) or refilled (CHANNEL ADD ... AT) between
+    // parsing and execution. Fail the command (403) rather than touch an empty slot or a different channel.
+    static const channel_context& checked_channel(const command_context_simple&                        simple_ctx,
+                                                  const spl::shared_ptr<std::vector<channel_context>>& channels)
+    {
+        const auto& slot = channels->at(simple_ctx.channel_index);
+        const auto& want = simple_ctx.target_channel;
+        const bool  had_target =
+            want.owner_before(std::weak_ptr<core::video_channel>{}) || std::weak_ptr<core::video_channel>{}.owner_before(want);
+        if (slot.empty() ||
+            (had_target && (want.owner_before(slot.raw_channel) || slot.raw_channel.owner_before(want))))
+            CASPAR_THROW_EXCEPTION(expected_user_error() << msg_info(L"Channel " +
+                                                                     std::to_wstring(simple_ctx.channel_index + 1) +
+                                                                     L" was removed or replaced"));
+        return slot;
+    }
+
     std::shared_ptr<amcp_command_static_context> static_context_;
 };
 

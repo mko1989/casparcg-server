@@ -33,13 +33,14 @@ namespace caspar { namespace protocol { namespace amcp {
 class amcp_command_repository
 {
   public:
-    amcp_command_repository(const spl::shared_ptr<std::vector<channel_context>>& channels);
+    amcp_command_repository(const spl::shared_ptr<channel_list>& channels);
 
     std::shared_ptr<AMCPCommand>
          parse_command(IO::ClientInfoPtr client, std::list<std::wstring> tokens, const std::wstring& request_id) const;
     bool check_channel_lock(IO::ClientInfoPtr client, int channel_index) const;
 
-    const spl::shared_ptr<std::vector<channel_context>>& channels() const;
+    // HighAsCG WO-1020: the live, copy-on-write list (take ->snapshot() to read it).
+    const spl::shared_ptr<channel_list>& channels() const;
 
     void register_command(std::wstring category, std::wstring name, amcp_command_func command, int min_num_params);
 

@@ -58,6 +58,9 @@
 #include <boost/format.hpp>
 #include <boost/property_tree/ptree.hpp>
 
+#include <chrono>
+#include <mutex>
+#include <optional>
 #include <thread>
 #include <utility>
 
@@ -107,7 +110,12 @@ struct server::impl
     std::shared_ptr<IO::AsyncEventServer>                  primary_amcp_server_;
     std::shared_ptr<osc::client>                           osc_client_ = std::make_shared<osc::client>(io_context_);
     std::vector<std::shared_ptr<void>>                     predefined_osc_subscriptions_;
-    spl::shared_ptr<std::vector<protocol::amcp::channel_context>> channels_;
+    // HighAsCG WO-1020: copy-on-write so CHANNEL ADD/REMOVE can change it while AMCP threads read snapshots.
+    spl::shared_ptr<protocol::amcp::channel_list> channels_;
+    // HighAsCG WO-1020: per slot, the <channel> element INFO CONFIG reports (boot XML, or one written for a runtime
+    // CHANNEL ADD); empty = removed. Written inside channels_->modify(), read under slot_xml_mutex_.
+    std::mutex                                                   slot_xml_mutex_;
+    std::vector<std::optional<boost::property_tree::wptree>>     slot_xml_;
     spl::shared_ptr<core::cg_producer_registry>                   cg_registry_;
     spl::shared_ptr<core::frame_producer_registry>                producer_registry_;
     spl::shared_ptr<core::frame_consumer_registry>                consumer_registry_;
@@ -168,7 +176,10 @@ struct server::impl
 
         destroy_producers_synchronously();
         destroy_consumers_synchronously();
-        channels_->clear();
+        channels_->modify([](std::vector<protocol::amcp::channel_context>& list) {
+            list.clear();
+            return 0;
+        });
 
         while (weak_io_context.lock())
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -187,62 +198,16 @@ struct server::impl
                  pt | witerate_children(L"configuration.video-modes") | welement_context_iteration) {
                 ptree_verify_element_name(xml_channel, L"video-mode");
 
-                const std::wstring id = xml_channel.second.get(L"id", L"");
-                if (id == L"")
-                    CASPAR_THROW_EXCEPTION(user_error() << msg_info(L"Invalid video-mode id: " + id));
-
-                const int width  = xml_channel.second.get<int>(L"width", 0);
-                const int height = xml_channel.second.get<int>(L"height", 0);
-                if (width == 0 || height == 0)
-                    CASPAR_THROW_EXCEPTION(user_error() << msg_info(L"Invalid dimensions: " +
-                                                                    boost::lexical_cast<std::wstring>(width) + L"x" +
-                                                                    boost::lexical_cast<std::wstring>(height)));
-
-                const int field_count = xml_channel.second.get<int>(L"field-count", 1);
-                if (field_count != 1 && field_count != 2)
-                    CASPAR_THROW_EXCEPTION(user_error() << msg_info(L"Invalid field-count: " +
-                                                                    boost::lexical_cast<std::wstring>(field_count)));
-
-                const int timescale = xml_channel.second.get<int>(L"time-scale", 60000);
-                const int duration  = xml_channel.second.get<int>(L"duration", 1000);
-                if (timescale == 0 || duration == 0)
-                    CASPAR_THROW_EXCEPTION(
-                        user_error() << msg_info(L"Invalid framerate: " + boost::lexical_cast<std::wstring>(timescale) +
-                                                 L"/" + boost::lexical_cast<std::wstring>(duration)));
-
-                std::vector<int> cadence;
-                int              cadence_sum = 0;
-
-                const std::wstring      cadence_str = xml_channel.second.get(L"cadence", L"");
-                std::list<std::wstring> cadence_parts;
-                boost::split(cadence_parts, cadence_str, boost::is_any_of(L", "));
-
-                for (auto& cad : cadence_parts) {
-                    if (cad.empty())
-                        continue;
-
-                    const int c = std::stoi(cad);
-                    cadence.push_back(c);
-                    cadence_sum += c;
-                }
-
-                if (cadence.empty()) {
-                    // Attempt to calculate in the cadence for integer formats
-                    const int c = static_cast<int>(48000 / (static_cast<double>(timescale) / duration) + 0.5);
-                    cadence.push_back(c);
-                    cadence_sum += c;
-                }
-
-                if (cadence_sum * timescale != 48000 * duration * cadence.size()) {
-                    auto samples_per_second =
-                        static_cast<double>(cadence_sum * timescale) / (duration * cadence.size());
-                    CASPAR_THROW_EXCEPTION(user_error() << msg_info(L"Incorrect cadence in video-mode " + id +
-                                                                    L". Got " + std::to_wstring(samples_per_second) +
-                                                                    L" samples per second, expected 48000"));
-                }
-
-                const auto new_format = video_format_desc(
-                    video_format::custom, field_count, width, height, width, height, timescale, duration, id, cadence);
+                // HighAsCG WO-1020: the checks live in core so AMCP VIDEO-MODE ADD applies exactly the same ones.
+                const std::wstring id         = xml_channel.second.get(L"id", L"");
+                const auto         new_format = core::make_custom_video_format_desc(
+                    id,
+                    xml_channel.second.get<int>(L"width", 0),
+                    xml_channel.second.get<int>(L"height", 0),
+                    xml_channel.second.get<int>(L"field-count", 1),
+                    xml_channel.second.get<int>(L"time-scale", 60000),
+                    xml_channel.second.get<int>(L"duration", 1000),
+                    xml_channel.second.get(L"cadence", L""));
 
                 const auto existing = video_format_repository_.find(id);
                 if (existing.format != video_format::invalid)
@@ -253,54 +218,228 @@ struct server::impl
         }
     }
 
+    // HighAsCG WO-1020: one channel, as setup_channels made them at startup; also used by CHANNEL ADD at runtime.
+    protocol::amcp::channel_context make_channel(int                             channel_id,
+                                                 const core::video_format_desc&  format_desc,
+                                                 int                             color_depth,
+                                                 const std::wstring&             color_space_name)
+    {
+        if (color_depth != 8 && color_depth != 16)
+            CASPAR_THROW_EXCEPTION(user_error() << msg_info(L"Invalid color-depth: " + std::to_wstring(color_depth)));
+
+        auto color_space_str = boost::to_lower_copy(color_space_name);
+        if (color_space_str != L"bt709" && color_space_str != L"bt2020")
+            CASPAR_THROW_EXCEPTION(user_error() << msg_info(L"Invalid color-space, must be bt709 or bt2020"));
+
+        if (format_desc.format == video_format::invalid)
+            CASPAR_THROW_EXCEPTION(user_error() << msg_info(L"Invalid video-mode: " + format_desc.name));
+
+        auto weak_client = std::weak_ptr<osc::client>(osc_client_);
+        auto depth       = color_depth == 16 ? common::bit_depth::bit16 : common::bit_depth::bit8;
+        auto default_color_space =
+            color_space_str == L"bt2020" ? core::color_space::bt2020 : core::color_space::bt709;
+        auto channel =
+            spl::make_shared<video_channel>(channel_id,
+                                            format_desc,
+                                            default_color_space,
+                                            accelerator_.create_image_mixer(channel_id, depth),
+                                            [channel_id, weak_client](core::monitor::state channel_state) {
+                                                monitor::state state;
+                                                state[""]["channel"][channel_id] = channel_state;
+                                                auto client                      = weak_client.lock();
+                                                if (client) {
+                                                    client->send(std::move(state));
+                                                }
+                                            });
+
+        const std::wstring lifecycle_key = L"lock" + std::to_wstring(channel_id);
+        return protocol::amcp::channel_context(channel, channel->stage(), lifecycle_key);
+    }
+
     std::vector<boost::property_tree::wptree> setup_channels(const boost::property_tree::wptree& pt)
     {
         using boost::property_tree::wptree;
 
         std::vector<wptree> xml_channels;
 
-        for (auto& xml_channel : pt | witerate_children(L"configuration.channels") | welement_context_iteration) {
-            xml_channels.push_back(xml_channel.second);
-            ptree_verify_element_name(xml_channel, L"channel");
+        channels_->modify([&](std::vector<protocol::amcp::channel_context>& list) {
+            for (auto& xml_channel : pt | witerate_children(L"configuration.channels") | welement_context_iteration) {
+                xml_channels.push_back(xml_channel.second);
+                ptree_verify_element_name(xml_channel, L"channel");
 
-            auto format_desc_str = xml_channel.second.get(L"video-mode", L"PAL");
-            auto format_desc     = video_format_repository_.find(format_desc_str);
-            auto color_depth     = xml_channel.second.get<unsigned char>(L"color-depth", 8);
-            if (color_depth != 8 && color_depth != 16)
-                CASPAR_THROW_EXCEPTION(user_error()
-                                       << msg_info(L"Invalid color-depth: " + std::to_wstring(color_depth)));
+                auto format_desc_str = xml_channel.second.get(L"video-mode", L"PAL");
+                auto format_desc     = video_format_repository_.find(format_desc_str);
+                auto color_depth     = xml_channel.second.get<unsigned char>(L"color-depth", 8);
+                if (format_desc.format == video_format::invalid)
+                    CASPAR_THROW_EXCEPTION(user_error() << msg_info(L"Invalid video-mode: " + format_desc_str));
 
-            auto color_space_str = boost::to_lower_copy(xml_channel.second.get(L"color-space", L"bt709"));
-            if (color_space_str != L"bt709" && color_space_str != L"bt2020")
-                CASPAR_THROW_EXCEPTION(user_error() << msg_info(L"Invalid color-space, must be bt709 or bt2020"));
+                list.emplace_back(make_channel(static_cast<int>(list.size() + 1),
+                                               format_desc,
+                                               color_depth,
+                                               xml_channel.second.get(L"color-space", L"bt709")));
+            }
 
-            if (format_desc.format == video_format::invalid)
-                CASPAR_THROW_EXCEPTION(user_error() << msg_info(L"Invalid video-mode: " + format_desc_str));
-
-            auto weak_client = std::weak_ptr<osc::client>(osc_client_);
-            auto channel_id  = static_cast<int>(channels_->size() + 1);
-            auto depth       = color_depth == 16 ? common::bit_depth::bit16 : common::bit_depth::bit8;
-            auto default_color_space =
-                color_space_str == L"bt2020" ? core::color_space::bt2020 : core::color_space::bt709;
-            auto channel =
-                spl::make_shared<video_channel>(channel_id,
-                                                format_desc,
-                                                default_color_space,
-                                                accelerator_.create_image_mixer(channel_id, depth),
-                                                [channel_id, weak_client](core::monitor::state channel_state) {
-                                                    monitor::state state;
-                                                    state[""]["channel"][channel_id] = channel_state;
-                                                    auto client                      = weak_client.lock();
-                                                    if (client) {
-                                                        client->send(std::move(state));
-                                                    }
-                                                });
-
-            const std::wstring lifecycle_key = L"lock" + std::to_wstring(channel_id);
-            channels_->emplace_back(channel, channel->stage(), lifecycle_key);
-        }
+            std::lock_guard<std::mutex> lock(slot_xml_mutex_);
+            slot_xml_.assign(xml_channels.begin(), xml_channels.end());
+            return 0;
+        });
 
         return xml_channels;
+    }
+
+    // HighAsCG WO-1020: CHANNEL ADD. Runs on an AMCP thread; the list's write lock serialises it with REMOVE.
+    int add_channel(const core::video_format_desc& format_desc,
+                    int                            color_depth,
+                    const std::wstring&            color_space,
+                    int                            at)
+    {
+        return channels_->modify([&](std::vector<protocol::amcp::channel_context>& list) -> int {
+            size_t slot = list.size(); // append: numbers are never reused unless asked for with AT
+            if (at > 0) {
+                slot = static_cast<size_t>(at - 1);
+                if (slot > list.size())
+                    CASPAR_THROW_EXCEPTION(user_error() << msg_info(L"CHANNEL ADD AT " + std::to_wstring(at) +
+                                                                    L": not an empty slot or the next number"));
+                if (slot < list.size() && !list[slot].empty())
+                    CASPAR_THROW_EXCEPTION(user_error()
+                                           << msg_info(L"CHANNEL ADD AT " + std::to_wstring(at) + L": channel exists"));
+            }
+
+            const int  channel_id = static_cast<int>(slot + 1);
+            auto       context    = make_channel(channel_id, format_desc, color_depth, color_space);
+            if (slot == list.size()) {
+                list.push_back(context);
+            } else { // channel_context is not assignable: rebuild the copy with the slot filled
+                std::vector<protocol::amcp::channel_context> rebuilt;
+                rebuilt.reserve(list.size());
+                for (size_t n = 0; n < list.size(); ++n)
+                    rebuilt.push_back(n == slot ? context : list[n]);
+                list.swap(rebuilt);
+            }
+
+            boost::property_tree::wptree xml;
+            xml.put(L"<xmlattr>.runtime", L"true");
+            xml.put(L"video-mode", format_desc.name);
+            xml.put(L"color-depth", color_depth);
+            xml.put(L"color-space", boost::to_lower_copy(color_space));
+            xml.put_child(L"consumers", boost::property_tree::wptree());
+            {
+                std::lock_guard<std::mutex> lock(slot_xml_mutex_);
+                slot_xml_.resize(std::max(slot_xml_.size(), list.size()));
+                slot_xml_[slot] = std::move(xml);
+            }
+
+            CASPAR_LOG(info) << L"CHANNEL ADD: channel " << channel_id << L" " << format_desc.name << L" "
+                             << color_depth << L"-bit " << color_space;
+            return channel_id;
+        });
+    }
+
+    // HighAsCG WO-1020: CHANNEL REMOVE. See WO-1020 for the hazard analysis behind the order below.
+    std::wstring remove_channel(int channel_id, bool force, const IO::ClientInfoPtr& client)
+    {
+        // A route producer is destroyed on the producer destroyer thread a moment after its layer is stopped, so a
+        // REMOVE sent right after the STOP would still see the route. Give that up to 500 ms before deciding.
+        if (!force) {
+            const auto snapshot = channels_->snapshot();
+            if (channel_id >= 1 && channel_id <= static_cast<int>(snapshot->size()) &&
+                !snapshot->at(channel_id - 1).empty()) {
+                const auto& candidate = snapshot->at(channel_id - 1).raw_channel;
+                for (int n = 0; n < 50 && candidate->live_route_count() > 0; ++n)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+        }
+
+        std::shared_ptr<video_channel>             channel;
+        std::shared_ptr<IO::lock_container>        lock;
+        const std::wstring refusal = channels_->modify([&](std::vector<protocol::amcp::channel_context>& list) {
+            if (channel_id < 1 || channel_id > static_cast<int>(list.size()) || list[channel_id - 1].empty())
+                return std::wstring(L"401 CHANNEL REMOVE ERROR\r\n");
+
+            const auto& slot = list[channel_id - 1];
+            if (slot.lock && !slot.lock->check_access(client))
+                return std::wstring(L"503 CHANNEL REMOVE FAILED\r\n");
+
+            const int routes = slot.raw_channel->live_route_count();
+            if (routes > 0 && !force) {
+                CASPAR_LOG(warning) << L"CHANNEL REMOVE " << channel_id << L" refused: " << routes
+                                    << L" live route(s) from it. STOP them, or use FORCE.";
+                return L"403 CHANNEL REMOVE FAILED (" + std::to_wstring(routes) +
+                       L" live routes from it; STOP them or add FORCE)\r\n";
+            }
+
+            channel = slot.raw_channel;
+            lock    = slot.lock;
+
+            // 1. Empty the slot first: new commands can no longer reach the channel, and commands already parsed
+            //    against it fail when they run (command_context_factory checks the slot).
+            std::vector<protocol::amcp::channel_context> rebuilt;
+            rebuilt.reserve(list.size());
+            for (size_t n = 0; n < list.size(); ++n) {
+                if (static_cast<int>(n) == channel_id - 1)
+                    rebuilt.emplace_back();
+                else
+                    rebuilt.push_back(list[n]);
+            }
+            list.swap(rebuilt);
+
+            std::lock_guard<std::mutex> xml_lock(slot_xml_mutex_);
+            if (static_cast<size_t>(channel_id - 1) < slot_xml_.size())
+                slot_xml_[channel_id - 1].reset();
+            return std::wstring();
+        });
+        if (!refusal.empty())
+            return refusal;
+
+        // 2. Routes taken from it output nothing from now on (only reachable with FORCE, or a route raced in).
+        channel->close_routes();
+
+        // 3. Release LOCKs: the lifecycle objects bound to client connections refer to this container.
+        if (lock)
+            lock->clear_locks();
+
+        // 4. Outputs first, while the channel still ticks: screen windows close, DeckLink stops, streams end. Each
+        //    consumer is destroyed on its own thread (destroy_consumer_proxy), as with AMCP REMOVE.
+        const auto consumers = channel->output().clear();
+
+        // 5. Layers: producers go to the producer destroyer thread (HTML/CEF, FFmpeg, DeckLink input), as with CLEAR.
+        auto cleared = channel->stage()->clear();
+        if (cleared.wait_for(std::chrono::seconds(5)) != std::future_status::ready)
+            CASPAR_LOG(warning) << L"CHANNEL REMOVE " << channel_id << L": stage clear still pending after 5 s";
+
+        // 6. The video_channel itself (its thread, mixer, empty stage and output) is destroyed when the last
+        //    snapshot holding it is dropped. That is normally this command's own snapshot, released on this AMCP
+        //    queue thread right after the reply; a command running on another queue can hold it a little longer.
+        //    No producer or consumer keeps a strong reference to a channel (WO-1020 investigation), so this is
+        //    never the channel's own thread. The destructor only has to join a thread that has no work left.
+        channel.reset();
+
+        CASPAR_LOG(info) << L"CHANNEL REMOVE: channel " << channel_id << L" removed (" << consumers
+                         << L" consumers" << (force ? L", FORCE" : L"") << L")";
+        return L"202 CHANNEL REMOVE OK\r\n";
+    }
+
+    // HighAsCG WO-1020: INFO CONFIG with <channels> as they are now. Removed slots are <channel removed="true"/>,
+    // so the numbering of the list still matches the live channel numbers.
+    boost::property_tree::wptree live_config()
+    {
+        auto pt = env::properties();
+
+        boost::property_tree::wptree channels;
+        {
+            std::lock_guard<std::mutex> lock(slot_xml_mutex_);
+            for (auto& xml : slot_xml_) {
+                if (xml) {
+                    channels.add_child(L"channel", *xml);
+                } else {
+                    boost::property_tree::wptree removed;
+                    removed.put(L"<xmlattr>.removed", L"true");
+                    channels.add_child(L"channel", removed);
+                }
+            }
+        }
+        pt.put_child(L"configuration.channels", channels);
+        return pt;
     }
 
     void setup_osc(const boost::property_tree::wptree& pt)
@@ -345,12 +484,14 @@ struct server::impl
     {
         auto console_client = spl::make_shared<IO::ConsoleClientInfo>();
 
+        const auto channels = channels_->snapshot();
+
         std::vector<spl::shared_ptr<core::video_channel>> channels_vec;
-        for (auto& cc : *channels_) {
+        for (auto& cc : *channels) {
             channels_vec.emplace_back(cc.raw_channel);
         }
 
-        for (auto& channel : *channels_) {
+        for (auto& channel : *channels) {
             core::diagnostics::scoped_call_context save;
             core::diagnostics::call_context::for_thread().video_channel = channel.raw_channel->index();
 
@@ -391,7 +532,7 @@ struct server::impl
                         auto cmd = amcp_command_repo_->parse_command(console_client, tokens, L"");
 
                         if (cmd) {
-                            std::wstring res = cmd->Execute(channels_).get();
+                            std::wstring res = cmd->Execute(channels_->snapshot()).get();
                             console_client->send(std::move(res), false);
                         }
                     } catch (const user_error&) {
@@ -420,6 +561,16 @@ struct server::impl
             u8(caspar::env::properties().get(L"configuration.amcp.media-server.port", L"8000")),
             ogl_device,
             spl::make_shared_ptr(osc_client_));
+
+        // HighAsCG WO-1020
+        ctx->channels_admin.add_channel = [this](const core::video_format_desc& format_desc,
+                                                 int                            color_depth,
+                                                 const std::wstring&            color_space,
+                                                 int at) { return add_channel(format_desc, color_depth, color_space, at); };
+        ctx->channels_admin.remove_channel = [this](int channel_id, bool force, const IO::ClientInfoPtr& client) {
+            return remove_channel(channel_id, force, client);
+        };
+        ctx->channels_admin.live_config = [this] { return live_config(); };
 
         amcp_context_factory_ = std::make_shared<amcp::command_context_factory>(ctx);
 

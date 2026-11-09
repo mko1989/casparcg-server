@@ -30,8 +30,7 @@
 
 namespace caspar { namespace protocol { namespace amcp {
 
-AMCPCommandQueue::AMCPCommandQueue(const std::wstring&                                  name,
-                                   const spl::shared_ptr<std::vector<channel_context>>& channels)
+AMCPCommandQueue::AMCPCommandQueue(const std::wstring& name, const spl::shared_ptr<channel_list>& channels)
     : executor_(L"AMCPCommandQueue " + name)
     , channels_(channels)
 {
@@ -119,7 +118,7 @@ void AMCPCommandQueue::Execute(std::shared_ptr<AMCPGroupCommand> cmd) const
 
     // Shortcut for commands which are either not a batch, or don't need to be
     if (cmd->Commands().size() == 1) {
-        exec_cmd(cmd->Commands().at(0), channels_, true);
+        exec_cmd(cmd->Commands().at(0), channels_->snapshot(), true);
         return;
     }
 
@@ -132,7 +131,11 @@ void AMCPCommandQueue::Execute(std::shared_ptr<AMCPGroupCommand> cmd) const
     std::vector<std::unique_lock<std::mutex>>         channel_locks;
 
     try {
-        for (auto& ch : *channels_) {
+        for (auto& ch : *channels_->snapshot()) {
+            if (ch.empty()) { // HighAsCG WO-1020: keep removed slots so positions (channel numbers) match
+                delayed_channels->emplace_back();
+                continue;
+            }
             auto st = std::make_shared<core::stage_delayed>(ch.raw_channel->stage(), ch.raw_channel->index());
             delayed_stages.push_back(st);
             delayed_channels->emplace_back(ch.raw_channel, st, ch.lifecycle_key_);

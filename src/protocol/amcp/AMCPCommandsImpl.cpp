@@ -192,9 +192,19 @@ std::vector<spl::shared_ptr<core::video_channel>> get_channels(const command_con
 {
     std::vector<spl::shared_ptr<core::video_channel>> result;
     for (auto& cc : *ctx.channels) {
-        result.emplace_back(cc.raw_channel);
+        if (!cc.empty()) // HighAsCG WO-1020: removed slots
+            result.emplace_back(cc.raw_channel);
     }
     return result;
+}
+
+// HighAsCG WO-1020: a channel named in a parameter (SWAP, LOCK). A removed slot is a user error (403).
+const channel_context& existing_channel(const command_context& ctx, int channel_number)
+{
+    const auto& slot = ctx.channels->at(channel_number - 1); // out_of_range -> 402, as before
+    if (slot.empty())
+        CASPAR_THROW_EXCEPTION(user_error() << msg_info(L"Channel " + std::to_wstring(channel_number) + L" was removed"));
+    return slot;
 }
 
 core::frame_producer_dependencies get_producer_dependencies(const std::shared_ptr<core::video_channel>& channel,
@@ -399,7 +409,8 @@ std::wstring clear_command(command_context& ctx)
 std::wstring clear_all_command(command_context& ctx)
 {
     for (auto& ch : *ctx.channels) {
-        ch.stage->clear();
+        if (!ch.empty()) // HighAsCG WO-1020
+            ch.stage->clear();
     }
 
     return L"202 CLEAR ALL OK\r\n";
@@ -459,14 +470,14 @@ std::wstring swap_command(command_context& ctx)
         std::vector<std::wstring> strs;
         boost::split(strs, ctx.parameters[0], boost::is_any_of(L"-"));
 
-        auto ch2 = ctx.channels->at(std::stoi(strs.at(0)) - 1);
+        auto ch2 = existing_channel(ctx, std::stoi(strs.at(0)));
 
         int l1 = ctx.layer_index();
         int l2 = std::stoi(strs.at(1));
 
         ctx.channel.stage->swap_layer(l1, l2, ch2.stage, swap_transforms);
     } else {
-        auto ch2 = ctx.channels->at(std::stoi(ctx.parameters[0]) - 1);
+        auto ch2 = existing_channel(ctx, std::stoi(ctx.parameters[0]));
         ctx.channel.stage->swap_layers(ch2.stage, swap_transforms);
     }
 
@@ -1543,11 +1554,23 @@ std::wstring mixer_clear_command(command_context& ctx)
 
 std::wstring channel_grid_command(command_context& ctx)
 {
-    int   index = 1;
-    auto& self  = ctx.channels->back();
+    int index = 1;
+
+    // HighAsCG WO-1020: the last live channel (trailing slots may be removed ones).
+    const channel_context* last = nullptr;
+    int                    live = 0;
+    for (auto& ch : *ctx.channels) {
+        if (!ch.empty()) {
+            last = &ch;
+            ++live;
+        }
+    }
+    if (!last)
+        CASPAR_THROW_EXCEPTION(user_error() << msg_info(L"CHANNEL_GRID needs a channel"));
+    auto& self = *last;
 
     core::diagnostics::scoped_call_context save;
-    core::diagnostics::call_context::for_thread().video_channel = ctx.channels->size();
+    core::diagnostics::call_context::for_thread().video_channel = self.raw_channel->index();
 
     std::vector<std::wstring> params;
     params.emplace_back(L"SCREEN");
@@ -1563,7 +1586,7 @@ std::wstring channel_grid_command(command_context& ctx)
     self.raw_channel->output().add(screen);
 
     for (auto& ch : *ctx.channels) {
-        if (ch.raw_channel != self.raw_channel) {
+        if (!ch.empty() && ch.raw_channel != self.raw_channel) {
             core::diagnostics::call_context::for_thread().layer = index;
             auto producer = ctx.static_context->producer_registry->create_producer(
                 get_producer_dependencies(self.raw_channel, ctx),
@@ -1574,7 +1597,7 @@ std::wstring channel_grid_command(command_context& ctx)
         }
     }
 
-    auto num_channels       = ctx.channels->size() - 1;
+    auto num_channels       = live - 1;
     int  square_side_length = std::ceil(std::sqrt(num_channels));
 
     auto ctx2 =
@@ -1702,6 +1725,8 @@ std::wstring info_command(command_context& ctx)
     replyString << L"200 INFO OK\r\n";
 
     for (auto& ch : *ctx.channels) {
+        if (ch.empty()) // HighAsCG WO-1020: removed channels are not listed; the numbers of the rest stay
+            continue;
         replyString << ch.raw_channel->index() << L" " << ch.raw_channel->stage()->video_format_desc().name
                     << L" PLAYING\r\n";
     }
@@ -1716,7 +1741,11 @@ std::wstring info_config_command(command_context& ctx)
     replyString << L"201 INFO CONFIG OK\r\n";
 
     pt::xml_writer_settings<std::wstring> w(' ', 3);
-    pt::xml_parser::write_xml(replyString, caspar::env::properties(), w);
+    // HighAsCG WO-1020: channels added/removed at runtime are reflected in <channels>.
+    if (ctx.static_context->channels_admin.live_config)
+        pt::xml_parser::write_xml(replyString, ctx.static_context->channels_admin.live_config(), w);
+    else
+        pt::xml_parser::write_xml(replyString, caspar::env::properties(), w);
 
     replyString << L"\r\n";
     return replyString.str();
@@ -1770,8 +1799,7 @@ std::wstring restart_command(command_context& ctx)
 
 std::wstring lock_command(command_context& ctx)
 {
-    int  channel_index = std::stoi(ctx.parameters.at(0)) - 1;
-    auto lock          = ctx.channels->at(channel_index).lock;
+    auto lock = existing_channel(ctx, std::stoi(ctx.parameters.at(0))).lock; // HighAsCG WO-1020: no empty slots
     auto command       = boost::to_upper_copy(ctx.parameters.at(1));
 
     if (command == L"ACQUIRE") {
@@ -1875,6 +1903,120 @@ std::wstring osc_unsubscribe_command(command_context& ctx)
     return L"202 OSC UNSUBSCRIBE OK\r\n";
 }
 
+// HighAsCG WO-1020: runtime channels and video modes.
+
+// CHANNEL ADD <video-mode> [8|16 | DEPTH 8|16] [BT709|BT2020] [AT <n>]
+// Appends a channel (after the highest number ever used), or fills the empty slot <n> left by a CHANNEL REMOVE.
+// Existing numbers never shift. Reply: 201 CHANNEL ADD OK, then the new channel number.
+std::wstring channel_add_command(command_context& ctx)
+{
+    const auto& admin = ctx.static_context->channels_admin;
+    if (!admin.add_channel)
+        return L"501 CHANNEL ADD FAILED\r\n";
+
+    const auto format_desc = ctx.static_context->format_repository.find(ctx.parameters.at(0));
+    if (format_desc.format == core::video_format::invalid)
+        CASPAR_THROW_EXCEPTION(user_error() << msg_info(L"Invalid video mode: " + ctx.parameters.at(0)));
+
+    int          depth       = 8;
+    std::wstring color_space = L"bt709";
+    int          at          = 0;
+    for (size_t i = 1; i < ctx.parameters.size(); ++i) {
+        const auto p = boost::to_upper_copy(ctx.parameters.at(i));
+        if (p == L"8" || p == L"16")
+            depth = boost::lexical_cast<int>(p);
+        else if (p == L"DEPTH")
+            depth = boost::lexical_cast<int>(ctx.parameters.at(++i));
+        else if (p == L"BT709" || p == L"BT2020")
+            color_space = boost::to_lower_copy(p);
+        else if (p == L"AT") {
+            at = boost::lexical_cast<int>(ctx.parameters.at(++i));
+            if (at < 1)
+                CASPAR_THROW_EXCEPTION(user_error() << msg_info(L"CHANNEL ADD AT needs a channel number >= 1"));
+        } else
+            CASPAR_THROW_EXCEPTION(user_error() << msg_info(L"Unknown CHANNEL ADD parameter: " + ctx.parameters.at(i)));
+    }
+    if (depth != 8 && depth != 16)
+        CASPAR_THROW_EXCEPTION(user_error() << msg_info(L"Invalid color-depth: " + std::to_wstring(depth)));
+
+    const int channel = admin.add_channel(format_desc, depth, color_space, at);
+    return L"201 CHANNEL ADD OK\r\n" + std::to_wstring(channel) + L"\r\n";
+}
+
+// CHANNEL REMOVE <n> [FORCE]
+// Refused (403) while a route:// taken from the channel is live, unless FORCE: those routes then output nothing.
+std::wstring channel_remove_command(command_context& ctx)
+{
+    const auto& admin = ctx.static_context->channels_admin;
+    if (!admin.remove_channel)
+        return L"501 CHANNEL REMOVE FAILED\r\n";
+
+    const int channel = boost::lexical_cast<int>(ctx.parameters.at(0));
+    bool      force   = false;
+    for (size_t i = 1; i < ctx.parameters.size(); ++i) {
+        if (boost::iequals(ctx.parameters.at(i), L"FORCE"))
+            force = true;
+        else
+            CASPAR_THROW_EXCEPTION(user_error()
+                                   << msg_info(L"Unknown CHANNEL REMOVE parameter: " + ctx.parameters.at(i)));
+    }
+
+    return admin.remove_channel(channel, force, ctx.client);
+}
+
+// VIDEO-MODE ADD <id> <width> <height> <time-scale> <duration> [<field-count> 1|2 | P | I] [<cadence> ...]
+// The same fields and checks as a <video-mode> in <video-modes> (time-scale/duration = frames per second, e.g.
+// 50000 1000 or 60000 1001). Adding an id that exists with the same parameters is a no-op (202); with different ones
+// it fails (403). The mode is then usable by CHANNEL ADD and SET <ch> MODE.
+std::wstring video_mode_add_command(command_context& ctx)
+{
+    const auto& params = ctx.parameters;
+    const auto  id     = params.at(0);
+    const int   width  = boost::lexical_cast<int>(params.at(1));
+    const int   height = boost::lexical_cast<int>(params.at(2));
+    const int   scale  = boost::lexical_cast<int>(params.at(3));
+    const int   dur    = boost::lexical_cast<int>(params.at(4));
+
+    int    field_count = 1;
+    size_t next        = 5;
+    if (params.size() > next) {
+        const auto f = boost::to_upper_copy(params.at(next));
+        if (f == L"1" || f == L"P") {
+            field_count = 1;
+            ++next;
+        } else if (f == L"2" || f == L"I") {
+            field_count = 2;
+            ++next;
+        }
+    }
+
+    std::wstring cadence;
+    for (; next < params.size(); ++next)
+        cadence += params.at(next) + L" ";
+
+    // Far above any real output; keeps a typo from asking the GPU for an absurd texture.
+    constexpr int max_side = 32768;
+    if (width > max_side || height > max_side)
+        CASPAR_THROW_EXCEPTION(user_error() << msg_info(L"Video mode too large (max " + std::to_wstring(max_side) +
+                                                        L" per side)"));
+
+    const auto desc     = core::make_custom_video_format_desc(id, width, height, field_count, scale, dur, cadence);
+    auto       repo     = ctx.static_context->format_repository;
+    const auto existing = repo.find(id);
+    if (existing.format != core::video_format::invalid) {
+        if (core::same_video_mode(existing, desc))
+            return L"202 VIDEO-MODE ADD OK\r\n";
+        CASPAR_THROW_EXCEPTION(user_error() << msg_info(L"Video-mode already exists with other parameters: " + id));
+    }
+
+    if (!repo.store(desc) && !core::same_video_mode(repo.find(id), desc))
+        CASPAR_THROW_EXCEPTION(user_error() << msg_info(L"Video-mode already exists with other parameters: " + id));
+
+    CASPAR_LOG(info) << L"Added video mode " << id << L" " << width << L"x" << height << L" " << scale << L"/" << dur
+                     << L" fields " << field_count;
+    return L"202 VIDEO-MODE ADD OK\r\n";
+}
+
 void register_commands(std::shared_ptr<amcp_command_repository_wrapper>& repo)
 {
     repo->register_channel_command(L"Basic Commands", L"LOADBG", loadbg_command, 1);
@@ -1958,5 +2100,10 @@ void register_commands(std::shared_ptr<amcp_command_repository_wrapper>& repo)
 
     repo->register_command(L"Query Commands", L"OSC SUBSCRIBE", osc_subscribe_command, 1);
     repo->register_command(L"Query Commands", L"OSC UNSUBSCRIBE", osc_unsubscribe_command, 1);
+
+    // HighAsCG WO-1020
+    repo->register_command(L"Channel Commands", L"CHANNEL ADD", channel_add_command, 1);
+    repo->register_command(L"Channel Commands", L"CHANNEL REMOVE", channel_remove_command, 1);
+    repo->register_command(L"Channel Commands", L"VIDEO-MODE ADD", video_mode_add_command, 5);
 }
 }}} // namespace caspar::protocol::amcp

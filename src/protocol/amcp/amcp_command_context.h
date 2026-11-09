@@ -25,6 +25,8 @@
 #include "amcp_command_repository.h"
 #include "amcp_shared.h"
 #include <accelerator/accelerator.h>
+#include <boost/property_tree/ptree.hpp>
+#include <functional>
 #include <future>
 #include <utility>
 
@@ -33,6 +35,20 @@ class client;
 }
 
 namespace caspar { namespace protocol { namespace amcp {
+
+// HighAsCG WO-1020: runtime channel administration, implemented by the server (shell/server.cpp), which owns the
+// accelerator, the OSC client and the channel list. Empty functions = not available (the commands answer 501).
+struct channel_admin
+{
+    // Creates a channel; at = 0 appends after the highest number ever used, at = n fills the empty slot n (or
+    // appends when n is one past the end). Returns the new 1-based channel number. Throws user_error.
+    std::function<int(const core::video_format_desc& format, int color_depth, const std::wstring& color_space, int at)>
+        add_channel;
+    // Tears channel n down (1-based) and leaves its slot empty. Returns the AMCP reply line.
+    std::function<std::wstring(int channel, bool force, const IO::ClientInfoPtr& client)> remove_channel;
+    // The boot configuration with <channels> replaced by the live list (INFO CONFIG).
+    std::function<boost::property_tree::wptree()> live_config;
+};
 
 struct amcp_command_static_context
 {
@@ -46,6 +62,7 @@ struct amcp_command_static_context
     const std::string                                          proxy_port;
     std::weak_ptr<accelerator::accelerator_device>             ogl_device;
     const spl::shared_ptr<osc::client>                         osc_client;
+    channel_admin                                              channels_admin; // HighAsCG WO-1020, set by the server
 
     amcp_command_static_context(core::video_format_repository                               format_repository,
                                 const spl::shared_ptr<core::cg_producer_registry>&          cg_registry,
