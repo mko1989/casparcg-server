@@ -32,7 +32,9 @@
 
 #include <boost/signals2.hpp>
 
+#include <atomic>
 #include <functional>
+#include <mutex>
 
 namespace caspar { namespace core {
 
@@ -55,14 +57,39 @@ struct route
 {
     route()             = default;
     route(const route&) = delete;
-    route(route&&)      = default;
+    route(route&&)      = delete;
 
     route& operator=(const route&) = delete;
-    route& operator=(route&&)      = default;
+    route& operator=(route&&)      = delete;
 
     boost::signals2::signal<void(class draw_frame, class draw_frame)> signal;
-    video_format_desc                                                 format_desc;
     std::wstring                                                      name;
+
+    // HighAsCG WO-1020: the source format is read by the consuming channel's thread every tick and refreshed by the
+    // source channel when its mode changes (SET MODE), so it is behind a mutex (was a plain field, set once).
+    video_format_desc format_desc() const
+    {
+        std::lock_guard<std::mutex> lock(format_mutex_);
+        return format_desc_;
+    }
+    double fps() const
+    {
+        std::lock_guard<std::mutex> lock(format_mutex_);
+        return format_desc_.fps;
+    }
+    void set_format_desc(const video_format_desc& format_desc)
+    {
+        std::lock_guard<std::mutex> lock(format_mutex_);
+        format_desc_ = format_desc;
+    }
+
+    // HighAsCG WO-1020: set when the source channel is removed (CHANNEL REMOVE). Route producers then output nothing
+    // (transparent, silent) instead of repeating their last frame and its audio forever.
+    std::atomic<bool> source_removed{false};
+
+  private:
+    mutable std::mutex format_mutex_;
+    video_format_desc  format_desc_;
 };
 
 class video_channel final
@@ -94,6 +121,12 @@ class video_channel final
     [[nodiscard]] channel_info get_consumer_channel_info() const;
 
     std::shared_ptr<core::route> route(int index = -1, route_mode mode = route_mode::foreground);
+
+    // HighAsCG WO-1020: routes taken from this channel that some producer still holds (route:// on any channel,
+    // including this one).
+    int live_route_count() const;
+    // HighAsCG WO-1020: CHANNEL REMOVE. Marks every live route (and any route asked for later) as source_removed.
+    void close_routes();
 
   private:
     struct impl;

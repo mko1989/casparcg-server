@@ -143,7 +143,7 @@ class route_producer
         is_cross_channel_ = cross;
         if (cross) {
             buffer_.set_capacity(2);
-            source_format_ = route_->format_desc;
+            source_format_ = route_->format_desc();
         } else {
             buffer_.set_capacity(1);
             source_format_ = core::video_format_desc();
@@ -199,7 +199,7 @@ class route_producer
                         self->graph_->set_tag(diagnostics::tag_severity::WARNING, "dropped-frame");
                     }
                     self->graph_->set_value("produce-time",
-                                            self->produce_timer_.elapsed() * self->route_->format_desc.fps * 0.5);
+                                            self->produce_timer_.elapsed() * self->route_->fps() * 0.5);
                     self->produce_timer_.restart();
                 }
             });
@@ -207,6 +207,11 @@ class route_producer
 
     draw_frame last_frame(const core::video_field field) override
     {
+        if (route_->source_removed) { // HighAsCG WO-1020: source channel removed
+            frame_.reset();
+            return core::draw_frame{};
+        }
+
         if (!frame_) {
             std::pair<core::draw_frame, core::draw_frame> frame;
             if (buffer_.try_pop(frame)) {
@@ -228,6 +233,13 @@ class route_producer
     core::video_field next_field_ = core::video_field::a;
     draw_frame receive_impl(core::video_field field, int nb_samples) override
     {
+        // HighAsCG WO-1020: the source channel was removed (CHANNEL REMOVE ... FORCE). Output nothing rather than
+        // repeating the last frame, whose audio would otherwise loop as a buzz.
+        if (route_->source_removed) {
+            frame_.reset();
+            return core::draw_frame{};
+        }
+
         // If going i -> p, alternate between the fields
         // Note: this doesn't fix the audio if going 50i -> 25p
         if (field == core::video_field::progressive && source_format_.field_count != 1 && format_desc_.fps >= source_format_.fps) {
@@ -244,7 +256,7 @@ class route_producer
             }
         }
 
-        graph_->set_value("consume-time", consume_timer_.elapsed() * route_->format_desc.fps * 0.5);
+        graph_->set_value("consume-time", consume_timer_.elapsed() * route_->fps() * 0.5);
         consume_timer_.restart();
 
         if (!frame_) {

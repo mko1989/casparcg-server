@@ -53,6 +53,8 @@ class output final
     void add(int index, const spl::shared_ptr<frame_consumer>& consumer);
     bool remove(const spl::shared_ptr<frame_consumer>& consumer);
     bool remove(int index);
+    // HighAsCG WO-1020: removes every consumer (CHANNEL REMOVE); returns how many there were.
+    size_t clear();
 
     std::future<bool> call(int index, const std::vector<std::wstring>& params);
 

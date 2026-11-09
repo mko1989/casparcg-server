@@ -72,7 +72,9 @@ struct video_channel::impl final
     std::function<void(core::monitor::state)> tick_;
 
     std::map<route_id, std::weak_ptr<core::route>> routes_;
-    std::mutex                                     routes_mutex_;
+    mutable std::mutex                             routes_mutex_;
+    bool                                           routes_closed_ = false; // HighAsCG WO-1020, under routes_mutex_
+    video_format_desc                              routes_format_;         // HighAsCG WO-1020, channel thread only
 
     std::atomic<bool> abort_request_{false};
     std::thread       thread_;
@@ -154,6 +156,17 @@ struct video_channel::impl final
                     auto          stage_frames = (*stage_)(frame_counter_, background_routes, routesCb);
                     graph_->set_value("produce-time", produce_timer.elapsed() * format_desc.hz * 0.5);
 
+                    // HighAsCG WO-1020 (audit P-d): after SET MODE, tell the routes taken from this channel.
+                    if (!same_video_mode(routes_format_, stage_frames.format_desc) ||
+                        routes_format_.name != stage_frames.format_desc.name) {
+                        routes_format_ = stage_frames.format_desc;
+                        std::lock_guard<std::mutex> lock(routes_mutex_);
+                        for (auto& r : routes_) {
+                            if (auto route = r.second.lock())
+                                route->set_format_desc(routes_format_);
+                        }
+                    }
+
                     // This is a little race prone, but at worst a new consumer will start with a frame of black
                     bool has_consumers = output_.consumer_count() > 0;
 
@@ -212,9 +225,11 @@ struct video_channel::impl final
 
         auto route = routes_[id].lock();
         if (!route) {
-            route              = std::make_shared<core::route>();
-            route->format_desc = stage_->video_format_desc(); // TODO this needs updating whenever the videomode changes
-            route->name        = std::to_wstring(channel_info_.index);
+            route = std::make_shared<core::route>();
+            // HighAsCG WO-1020: refreshed by the channel thread on SET MODE (was an upstream TODO).
+            route->set_format_desc(stage_->video_format_desc());
+            route->source_removed = routes_closed_;
+            route->name           = std::to_wstring(channel_info_.index);
             if (index != -1) {
                 route->name += L"/" + std::to_wstring(index);
             }
@@ -227,6 +242,27 @@ struct video_channel::impl final
         }
 
         return route;
+    }
+
+    int live_route_count() const
+    {
+        std::lock_guard<std::mutex> lock(routes_mutex_);
+        int                         count = 0;
+        for (auto& r : routes_) {
+            if (!r.second.expired())
+                ++count;
+        }
+        return count;
+    }
+
+    void close_routes()
+    {
+        std::lock_guard<std::mutex> lock(routes_mutex_);
+        routes_closed_ = true;
+        for (auto& r : routes_) {
+            if (auto route = r.second.lock())
+                route->source_removed = true;
+        }
     }
 
     std::wstring print() const
@@ -260,5 +296,7 @@ channel_info         video_channel::get_consumer_channel_info() const { return i
 core::monitor::state video_channel::state() const { return impl_->state_; }
 
 std::shared_ptr<route> video_channel::route(int index, route_mode mode) { return impl_->route(index, mode); }
+int                    video_channel::live_route_count() const { return impl_->live_route_count(); }
+void                   video_channel::close_routes() { impl_->close_routes(); }
 
 }} // namespace caspar::core

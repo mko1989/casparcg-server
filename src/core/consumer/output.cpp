@@ -82,6 +82,17 @@ struct output::impl
 
     bool remove(const spl::shared_ptr<frame_consumer>& consumer) { return remove(consumer->index()); }
 
+    size_t clear()
+    {
+        decltype(consumers_) removed;
+        {
+            std::lock_guard<std::mutex> lock(consumers_mutex_);
+            removed.swap(consumers_);
+        }
+        // Destroyed here, outside the lock (each goes to its own destroy thread via destroy_consumer_proxy).
+        return removed.size();
+    }
+
     std::future<bool> call(int index, const std::vector<std::wstring>& params)
     {
         std::lock_guard<std::mutex> lock(consumers_mutex_);
@@ -238,6 +249,7 @@ output::~output() {}
 void output::add(int index, const spl::shared_ptr<frame_consumer>& consumer) { impl_->add(index, consumer); }
 void output::add(const spl::shared_ptr<frame_consumer>& consumer) { impl_->add(consumer); }
 bool output::remove(int index) { return impl_->remove(index); }
+size_t output::clear() { return impl_->clear(); }
 bool output::remove(const spl::shared_ptr<frame_consumer>& consumer) { return impl_->remove(consumer); }
 std::future<bool> output::call(int index, const std::vector<std::wstring>& params)
 {
