@@ -5,7 +5,7 @@
 
 namespace caspar { namespace IO {
 
-struct lock_container::impl
+struct lock_container::impl : std::enable_shared_from_this<lock_container::impl>
 {
     std::wstring lifecycle_key_;
 
@@ -46,7 +46,13 @@ struct lock_container::impl
                 CASPAR_LOG(info) << lifecycle_key_ << " acquired";
 
                 {
-                    std::shared_ptr<void> obj(nullptr, [=](void*) { do_release_lock(weak_ptr); });
+                    // HighAsCG WO-1020: the callback outlives this container when its channel is removed (CHANNEL
+                    // REMOVE) while the client stays connected; it captured a raw this before.
+                    std::weak_ptr<impl>   weak_self = shared_from_this();
+                    std::shared_ptr<void> obj(nullptr, [weak_self, weak_ptr](void*) {
+                        if (auto self = weak_self.lock())
+                            self->do_release_lock(weak_ptr);
+                    });
                     conn->add_lifecycle_bound_object(lifecycle_key_, obj);
                 }
             }
@@ -103,7 +109,7 @@ struct lock_container::impl
 };
 
 lock_container::lock_container(const std::wstring& lifecycle_key)
-    : impl_(spl::make_unique<impl>(lifecycle_key))
+    : impl_(std::make_shared<impl>(lifecycle_key))
 {
 }
 lock_container::~lock_container() {}

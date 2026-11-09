@@ -19,7 +19,7 @@ class lock_container
 
   private:
     struct impl;
-    spl::unique_ptr<impl> impl_;
+    std::shared_ptr<impl> impl_; // HighAsCG WO-1020: shared so client-bound release callbacks can hold it weakly
 
     lock_container(const lock_container&)            = delete;
     lock_container& operator=(const lock_container&) = delete;
