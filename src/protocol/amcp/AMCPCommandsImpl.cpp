@@ -39,6 +39,7 @@
 #include <common/log.h>
 #include <common/os/filesystem.h>
 #include <common/param.h>
+#include <common/utf.h>
 
 #include <core/consumer/frame_consumer.h>
 #include <core/consumer/frame_consumer_registry.h>
@@ -507,8 +508,52 @@ std::future<std::wstring> apply_command(command_context& ctx)
     });
 }
 
+// HighAsCG WO-1020 (audit P-a/P-b): ADD ch[-idx] XML <consumer element>
+// The consumer is built by the same factory as a <consumers> child of casparcg.config, so every XML option (screen
+// always-on-top/stretch/aspect/colour/mipmaps/slices, all DeckLink options, artnet, pixel, ffmpeg realtime) can be
+// set live. The element is one AMCP parameter: quoted XML (escape " as \") or, if it does not start with '<', base64
+// of the UTF-8 XML. The index defaults to the consumer's own, as at startup.
+std::wstring add_xml_consumer(command_context& ctx)
+{
+    if (ctx.parameters.size() < 2)
+        return L"402 ADD FAILED\r\n";
+
+    auto xml = ctx.parameters.at(1);
+    if (!boost::starts_with(boost::trim_left_copy(xml), L"<")) {
+        const auto bytes = from_base64(u8(xml));
+        xml              = u16(std::string(bytes.begin(), bytes.end()));
+    }
+
+    pt::wptree         tree;
+    std::wstringstream stream(xml);
+    try {
+        pt::read_xml(stream, tree, pt::xml_parser::trim_whitespace | pt::xml_parser::no_comments);
+    } catch (const pt::xml_parser_error& e) {
+        CASPAR_THROW_EXCEPTION(user_error() << msg_info(L"ADD XML: " + u16(e.what())));
+    }
+    if (tree.size() != 1)
+        CASPAR_THROW_EXCEPTION(user_error() << msg_info(L"ADD XML needs exactly one consumer element"));
+
+    const auto& element = *tree.begin();
+
+    core::diagnostics::scoped_call_context save;
+    core::diagnostics::call_context::for_thread().video_channel = ctx.channel_index + 1;
+
+    auto consumer = ctx.static_context->consumer_registry->create_consumer(element.first,
+                                                                           element.second,
+                                                                           ctx.static_context->format_repository,
+                                                                           get_channels(ctx),
+                                                                           ctx.channel.raw_channel->get_consumer_channel_info());
+    ctx.channel.raw_channel->output().add(ctx.layer_index(consumer->index()), consumer);
+
+    return L"202 ADD OK\r\n";
+}
+
 std::wstring add_command(command_context& ctx)
 {
+    if (boost::iequals(ctx.parameters.at(0), L"XML")) // HighAsCG WO-1020
+        return add_xml_consumer(ctx);
+
     replace_placeholders(L"<CLIENT_IP_ADDRESS>", ctx.client->address(), ctx.parameters);
 
     core::diagnostics::scoped_call_context save;
