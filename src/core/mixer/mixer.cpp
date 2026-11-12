@@ -82,7 +82,11 @@ struct mixer::impl
         auto result  = image_mixer_->render(format_desc);
         auto audio   = audio_mixer_(format_desc, nb_samples);
 
-        state_["audio"] = audio_mixer_.state();
+        // HighAsCG WO-1046: a fresh state per frame. `state_["audio"] = …` MERGES keys (monitor::state_proxy), so a
+        // layer that stopped contributing audio kept its last audio/layer/<L>/volume forever (frozen meters).
+        monitor::state state;
+        state["audio"] = audio_mixer_.state();
+        state_         = std::move(state);
 
         auto depth = image_mixer_->depth();
 
