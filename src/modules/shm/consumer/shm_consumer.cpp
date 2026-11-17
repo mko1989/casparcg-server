@@ -6,7 +6,9 @@
  * hands the frame to a worker and returns a ready future. The worker copies the frame Caspar
  * already read back to CPU (image_mixer copy_async) — zero extra GPU work.
  *
- * AMCP:   ADD <ch>-<idx> SHM [NAME <name>]        (default name: ch<channel>)
+ * AMCP:   ADD <ch>-<idx> SHM [NAME <name>] [SCALE <1|2|4>]   (default name: ch<channel>)
+ *         SCALE n publishes the channel at 1/n of its width and height (each pixel the mean of a 2x2 block):
+ *         a previs / monitor reader of a very large canvas copies n*n times less (HighAsCG WO-1120).
  * Config: <shm><name>opgui</name></shm>
  * Segment: /dev/shm/highascg-<name>, ABI in ../hshm_abi.h
  */
@@ -33,7 +35,9 @@
 #include <condition_variable>
 #include <mutex>
 #include <optional>
+#include <cstring>
 #include <thread>
+#include <vector>
 
 namespace caspar { namespace shm {
 
@@ -42,6 +46,8 @@ struct shm_consumer : public core::frame_consumer
     const std::wstring      name_;
     core::video_format_desc format_desc_;
     int                     channel_index_ = 0;
+    const int               scale_         = 1;
+    std::vector<uint8_t>    scaled_; // worker only
 
     hshm::writer          writer_;
     std::mutex            writer_mutex_; // initialize() may remap while the worker publishes
@@ -57,8 +63,9 @@ struct shm_consumer : public core::frame_consumer
     std::thread                      worker_;
 
   public:
-    explicit shm_consumer(std::wstring name)
+    explicit shm_consumer(std::wstring name, int scale = 1)
         : name_(std::move(name))
+        , scale_(scale == 2 || scale == 4 ? scale : 1)
     {
     }
 
@@ -87,15 +94,16 @@ struct shm_consumer : public core::frame_consumer
         {
             std::lock_guard<std::mutex> wlock(writer_mutex_);
             writer_.open_shm(u8(name_),
-                             static_cast<uint32_t>(format_desc.width),
-                             static_cast<uint32_t>(format_desc.height),
+                             static_cast<uint32_t>(format_desc.width / scale_),
+                             static_cast<uint32_t>(format_desc.height / scale_),
                              static_cast<uint32_t>(format_desc.framerate.numerator()),
                              static_cast<uint32_t>(format_desc.framerate.denominator()),
                              static_cast<uint32_t>(channel_info.index));
         }
         if (!worker_.joinable())
             worker_ = std::thread([this] { run(); });
-        CASPAR_LOG(info) << print() << L" publishing " << format_desc.width << L"x" << format_desc.height
+        CASPAR_LOG(info) << print() << L" publishing " << format_desc.width / scale_ << L"x"
+                         << format_desc.height / scale_ << (scale_ > 1 ? L" (scaled)" : L"")
                          << L" to " << u16(writer_.object_name());
     }
 
@@ -130,8 +138,9 @@ struct shm_consumer : public core::frame_consumer
     {
         core::monitor::state state;
         state["shm/name"]      = name_;
-        state["shm/width"]     = format_desc_.width;
-        state["shm/height"]    = format_desc_.height;
+        state["shm/width"]     = format_desc_.width / scale_;
+        state["shm/height"]    = format_desc_.height / scale_;
+        state["shm/scale"]     = scale_;
         state["shm/published"] = static_cast<int64_t>(published_count_.load(std::memory_order_relaxed));
         state["shm/dropped"]   = static_cast<int64_t>(dropped_count_.load(std::memory_order_relaxed));
         return state;
@@ -156,10 +165,38 @@ struct shm_consumer : public core::frame_consumer
                 writer_.note_dropped(drops);
                 dropped_count_.fetch_add(drops, std::memory_order_relaxed);
                 const auto&  pixels   = frame.image_data(0);
-                const size_t expected = static_cast<size_t>(writer_.width()) * writer_.height() * 4;
-                if (pixels.size() < expected)
+                const size_t w        = writer_.width();
+                const size_t h        = writer_.height();
+                const size_t src_w    = static_cast<size_t>(format_desc_.width);
+                const size_t expected = src_w * static_cast<size_t>(format_desc_.height) * 4;
+                if (pixels.size() < expected || w * scale_ > src_w || h * scale_ > static_cast<size_t>(format_desc_.height))
                     continue; // geometry mismatch during a format change — skip, next initialize fixes it
-                writer_.publish(pixels.begin(), static_cast<size_t>(writer_.width()) * 4, ++frame_number_);
+                if (scale_ == 1) {
+                    writer_.publish(pixels.begin(), w * 4, ++frame_number_);
+                } else {
+                    // Each output pixel = the mean of the 2x2 block at the top-left of its scale x scale cell
+                    // (exact for SCALE 2). Per-byte average without carries between channels.
+                    scaled_.resize(w * h * 4);
+                    const uint8_t* src  = pixels.begin();
+                    const auto     avg2 = [](uint32_t a, uint32_t b) {
+                        return (a & b) + (((a ^ b) & 0xfefefefeu) >> 1);
+                    };
+                    for (size_t y = 0; y < h; ++y) {
+                        const uint8_t* r0  = src + (y * scale_) * src_w * 4;
+                        const uint8_t* r1  = r0 + src_w * 4;
+                        uint8_t*       dst = scaled_.data() + y * w * 4;
+                        for (size_t x = 0; x < w; ++x) {
+                            uint32_t a, b, c, d;
+                            std::memcpy(&a, r0 + x * scale_ * 4, 4);
+                            std::memcpy(&b, r0 + x * scale_ * 4 + 4, 4);
+                            std::memcpy(&c, r1 + x * scale_ * 4, 4);
+                            std::memcpy(&d, r1 + x * scale_ * 4 + 4, 4);
+                            const uint32_t o = avg2(avg2(a, b), avg2(c, d));
+                            std::memcpy(dst + x * 4, &o, 4);
+                        }
+                    }
+                    writer_.publish(scaled_.data(), w * 4, ++frame_number_);
+                }
                 published_count_.fetch_add(1, std::memory_order_relaxed);
             } catch (...) {
                 CASPAR_LOG_CURRENT_EXCEPTION();
@@ -183,8 +220,9 @@ create_consumer(const std::vector<std::wstring>&                         params,
     if (params.size() < 1 || !boost::iequals(params.at(0), L"SHM"))
         return core::frame_consumer::empty();
     require_8bit(channel_info);
-    auto name = get_param(L"NAME", params, L"ch" + std::to_wstring(channel_info.index));
-    return spl::make_shared<shm_consumer>(name);
+    auto name  = get_param(L"NAME", params, L"ch" + std::to_wstring(channel_info.index));
+    auto scale = get_param(L"SCALE", params, 1);
+    return spl::make_shared<shm_consumer>(name, scale);
 }
 
 spl::shared_ptr<core::frame_consumer>
@@ -195,7 +233,7 @@ create_preconfigured_consumer(const boost::property_tree::wptree&               
 {
     require_8bit(channel_info);
     auto name = ptree.get(L"name", L"ch" + std::to_wstring(channel_info.index));
-    return spl::make_shared<shm_consumer>(name);
+    return spl::make_shared<shm_consumer>(name, ptree.get(L"scale", 1));
 }
 
 }} // namespace caspar::shm
